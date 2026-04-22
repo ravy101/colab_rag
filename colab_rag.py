@@ -101,9 +101,9 @@ def build_database(db_dir, total_target = None, batch_size=5000, embedding_model
     print("\nAll indices built and saved to Drive.")
 
 class SimpleHybridRetriever:
-    def __init__(self, embedding_model="sentence-transformers/all-MiniLM-L6-v2", faiss_path = None, bm25s_path = None):
+    def __init__(self, embedding_model="sentence-transformers/all-MiniLM-L6-v2", faiss_path = None, bm25s_path = None, device='cpu'):
         drive.mount('/content/drive')
-        self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
+        self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': device})
         if faiss_path:
             self.vector_db = FAISS.load_local(faiss_path, self.embeddings, allow_dangerous_deserialization=True)
             print(f"Vector DB loaded with {len(self.vector_db.index_to_docstore_id)} items.")
@@ -115,7 +115,7 @@ class SimpleHybridRetriever:
             print(f"BM25s store loaded with {len(self.retriever_bm25.corpus)} items.")
         else:
             self.retriever_bm25 = None
-            
+
         self.stemmer = Stemmer("english")
 
     def hybrid_retrieve(self, query, k=5, rrf_k=60):

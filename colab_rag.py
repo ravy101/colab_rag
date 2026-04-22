@@ -50,7 +50,7 @@ def build_database(db_dir, total_target = None, batch_size=5000, embedding_model
 
     if total_target is None:
         total_target = 1000000000000
-        
+
     while current_idx < total_target:
         batch_docs = []
         batch_texts = []
@@ -102,6 +102,7 @@ def build_database(db_dir, total_target = None, batch_size=5000, embedding_model
 
 class SimpleHybridRetriever:
     def __init__(self, embedding_model="sentence-transformers/all-MiniLM-L6-v2", faiss_path = None, bm25s_path = None):
+        drive.mount('/content/drive')
         self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
         if faiss_path:
             self.vector_db = FAISS.load_local(faiss_path, self.embeddings, allow_dangerous_deserialization=True)

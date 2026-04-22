@@ -106,13 +106,16 @@ class SimpleHybridRetriever:
         self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
         if faiss_path:
             self.vector_db = FAISS.load_local(faiss_path, self.embeddings, allow_dangerous_deserialization=True)
+            print(f"Vector DB loaded with {len(self.vector_db.index_to_docstore_id)} items.")
         else:
             self.vector_db = None
         
         if bm25s_path:
             self.retriever_bm25 = bm25s.BM25.load(bm25s_path, load_corpus=True)
+            print(f"BM25s store loaded with {len(self.retriever_bm25.corpus)} items.")
         else:
             self.retriever_bm25 = None
+            
         self.stemmer = Stemmer("english")
 
     def hybrid_retrieve(self, query, k=5, rrf_k=60):

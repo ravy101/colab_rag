@@ -1,4 +1,4 @@
-from bm25s import BM25
+import bm25s
 from google.colab import drive
 from Stemmer import Stemmer
 from langchain_community.vectorstores import FAISS

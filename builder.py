@@ -32,7 +32,10 @@ def build_database(db_dir, total_target = None, batch_size=5000, embedding_model
 
     os.makedirs(FAISS_PATH, exist_ok=True)
     os.makedirs(BM25_PATH, exist_ok=True)
-    embeddings = HuggingFaceEmbeddings(model_name=embedding_model,  model_kwargs={'device': device})
+    if device == "cpu":
+        embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': "cpu"})
+    else:
+        embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': device})
     stemmer = Stemmer("english")
 
     # --- MAIN LOOP ---

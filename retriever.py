@@ -1,9 +1,5 @@
 import bm25s
-import os
-import json
-import bm25s
 from google.colab import drive
-from datasets import load_dataset
 from Stemmer import Stemmer
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings

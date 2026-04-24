@@ -10,7 +10,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 
 # --- UTILITIES ---
-def get_state(db_dir, target_):   
+def get_state(db_dir):   
     STATE_FILE = os.path.join(db_dir, "progress.json")
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f: 

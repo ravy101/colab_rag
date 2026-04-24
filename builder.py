@@ -1,4 +1,4 @@
-"""import bm25s
+import bm25s
 import os
 import json
 import bm25s
@@ -80,25 +80,33 @@ def build_database(db_dir, total_target = None, batch_size=5000, embedding_model
             new_faiss.save_local(FAISS_PATH)
 
         # 2. Update BM25S (Sparse)
-        # Note: BM25S is fast but prefers full-corpus indexing. 
-        # For incremental, we append texts and re-index the sparse matrix.
-        # We retrieve the previous texts if they exist to keep the index whole.
         current_corpus = []
-        if os.path.exists(os.path.join(BM25_PATH, "data.csc.npy")):
-            # Load existing corpus to append
-            old_retriever = bm25s.BM25.load(BM25_PATH, load_corpus=True)
-            current_corpus = list(old_retriever.corpus)
+        
+        # Check for the actual index file (more reliable than the .npy file)
+        if os.path.exists(os.path.join(BM25_PATH, "index.dat")):
+            try:
+                # Load existing corpus to append
+                old_retriever = bm25s.BM25.load(BM25_PATH, load_corpus=True)
+                # old_retriever.corpus is usually a list-like object
+                current_corpus = list(old_retriever.corpus)
+                print(f"Loaded {len(current_corpus)} existing docs for BM25.")
+            except Exception as e:
+                print(f"BM25 Load failed, starting fresh: {e}")
+                current_corpus = []
         
         current_corpus.extend(batch_texts)
         
-        # Re-index BM25 (Very fast with bm25s)
+        # Re-index BM25
+        # We MUST tokenize the entire combined corpus for a valid BM25 matrix
         tokens = bm25s.tokenize(current_corpus, stemmer=stemmer)
         retriever = bm25s.BM25(corpus=current_corpus)
         retriever.index(tokens)
-        retriever.save(BM25_PATH, corpus=current_corpus)
+        
+        # Save with overwrite=True to ensure Drive updates the files
+        retriever.save(BM25_PATH, corpus=current_corpus, overwrite=True)
 
         current_idx += len(batch_docs)
         save_state(db_dir, current_idx, []) 
         print(f"Success. Total docs in Hybrid Store: {current_idx}")
 
-    print("\nAll indices built and saved to Drive.")"""
+    print("\nAll indices built and saved to Drive.")

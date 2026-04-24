@@ -13,7 +13,11 @@ from langchain_core.documents import Document
 class SimpleHybridRetriever:
     def __init__(self, embedding_model="sentence-transformers/all-MiniLM-L6-v2", faiss_path = None, bm25s_path = None, device='cpu'):
         drive.mount('/content/drive')
-        self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': device})
+        if device == "cpu":
+            self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': "cpu"})
+        else:
+            self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': device})
+                                                    
         if faiss_path:
             self.vector_db = FAISS.load_local(faiss_path, self.embeddings, allow_dangerous_deserialization=True)
             print(f"Vector DB loaded with {len(self.vector_db.index_to_docstore_id)} items.")

@@ -1,15 +1,15 @@
-import bm25s
+from bm25s import BM25
 from google.colab import drive
-
+from Stemmer import Stemmer
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 
 
 class SimpleHybridRetriever:
     def __init__(self, embedding_model, faiss_path = None, bm25s_path = None, device='cpu'):
         drive.mount('/content/drive')
-        from Stemmer import Stemmer
-        from langchain_community.vectorstores import FAISS
-        from langchain_huggingface import HuggingFaceEmbeddings
-        from langchain_core.documents import Document
+
         self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model, 
                                                 model_kwargs={'device': 'cpu'},
                                                 encode_kwargs={'device': 'cpu'})

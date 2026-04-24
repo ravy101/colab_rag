@@ -2,6 +2,7 @@ import bm25s
 import os
 import json
 import bm25s
+import shutil
 from google.colab import drive
 from datasets import load_dataset
 from Stemmer import Stemmer
@@ -82,28 +83,30 @@ def build_database(db_dir, total_target = None, batch_size=5000, embedding_model
         # 2. Update BM25S (Sparse)
         current_corpus = []
         
-        # Check for the actual index file (more reliable than the .npy file)
+        # Check for index files
         if os.path.exists(os.path.join(BM25_PATH, "index.dat")):
             try:
                 # Load existing corpus to append
                 old_retriever = bm25s.BM25.load(BM25_PATH, load_corpus=True)
-                # old_retriever.corpus is usually a list-like object
                 current_corpus = list(old_retriever.corpus)
-                print(f"Loaded {len(current_corpus)} existing docs for BM25.")
+                print(f"Loaded {len(current_corpus)} existing docs.")
             except Exception as e:
-                print(f"BM25 Load failed, starting fresh: {e}")
-                current_corpus = []
+                print(f"BM25 Load failed: {e}")
         
         current_corpus.extend(batch_texts)
         
-        # Re-index BM25
-        # We MUST tokenize the entire combined corpus for a valid BM25 matrix
+        # Re-index
         tokens = bm25s.tokenize(current_corpus, stemmer=stemmer)
         retriever = bm25s.BM25(corpus=current_corpus)
         retriever.index(tokens)
         
-        # Save with overwrite=True to ensure Drive updates the files
-        retriever.save(BM25_PATH, corpus=current_corpus, overwrite=True)
+        # MANUAL OVERWRITE: Clear the folder first to avoid conflict
+        if os.path.exists(BM25_PATH):
+            shutil.rmtree(BM25_PATH)
+        os.makedirs(BM25_PATH, exist_ok=True)
+        
+        # Save fresh
+        retriever.save(BM25_PATH, corpus=current_corpus)
 
         current_idx += len(batch_docs)
         save_state(db_dir, current_idx, []) 

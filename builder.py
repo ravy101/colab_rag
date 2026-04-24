@@ -1,4 +1,4 @@
-import bm25s
+"""import bm25s
 import os
 import json
 import bm25s
@@ -101,4 +101,4 @@ def build_database(db_dir, total_target = None, batch_size=5000, embedding_model
         save_state(db_dir, current_idx, []) 
         print(f"Success. Total docs in Hybrid Store: {current_idx}")
 
-    print("\nAll indices built and saved to Drive.")
+    print("\nAll indices built and saved to Drive.")"""

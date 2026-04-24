@@ -1,18 +1,18 @@
 import bm25s
 from google.colab import drive
-from Stemmer import Stemmer
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.documents import Document
+
 
 
 class SimpleHybridRetriever:
-    def __init__(self, embedding_model="sentence-transformers/all-MiniLM-L6-v2", faiss_path = None, bm25s_path = None, device='cpu'):
+    def __init__(self, embedding_model, faiss_path = None, bm25s_path = None, device='cpu'):
         drive.mount('/content/drive')
-        if device == "cpu":
-            self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': "cpu"})
-        else:
-            self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': device})
+        from Stemmer import Stemmer
+        from langchain_community.vectorstores import FAISS
+        from langchain_huggingface import HuggingFaceEmbeddings
+        from langchain_core.documents import Document
+        self.embeddings = HuggingFaceEmbeddings(model_name=embedding_model, 
+                                                model_kwargs={'device': 'cpu'},
+                                                encode_kwargs={'device': 'cpu'})
                                                     
         if faiss_path:
             self.vector_db = FAISS.load_local(faiss_path, self.embeddings, allow_dangerous_deserialization=True)

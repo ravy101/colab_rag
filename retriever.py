@@ -76,7 +76,7 @@ class SimpleHybridRetriever:
             
         return final_output
 
-def consolidate_context(retrieval_results, threshold = 0.15):
+def consolidate_context(retrieval_results, threshold = 0.015):
     """
     Consolidates RRF results into a single string for LLM prompting.
     """
@@ -85,12 +85,20 @@ def consolidate_context(retrieval_results, threshold = 0.15):
     for i, entry in enumerate(retrieval_results):
         doc = entry['doc']
         score = entry['score']
+        title = "unknown subject"
+        
         if score < threshold:
             continue
+        
+        try:
+            title = doc.metadata['title']
+        except:
+            pass
+        
         # We include the index and a header to help the LLM cite its sources
-        header = f"[Source {i+1} | RRF Score: {score:.4f}]"
+        header = f"[Source {i+1} | RRF Score: {score:.4f} | Subject: {title}]"
         block = f"{header}\n{doc.page_content.strip()}"
         context_blocks.append(block)
-    prefix = "Supporting context sources may or may not contain the required information.\n"
+    prefix = "Supporting context sources may or may not contain the required information.\nSupporting sources may refer to other entities if not specified.\nIf sources are irrelevant, give your best guess as a short answer.\nDo not cite sources.\nDo not mention sources at all.\nDo not mention context.\nOnly output the direct answer to the question.\nIf you use the word 'source' or 'context' I will punish you.\n"
     return prefix + "\n\n".join(context_blocks)
 

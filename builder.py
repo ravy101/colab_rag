@@ -125,6 +125,68 @@ def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=Tru
     print("\nAll indices built and saved to Drive.")
 
 
+def build_faiss_database(db_dir, total_target = None, batch_size=5000, embedding_model= "sentence-transformers/all-MiniLM-L6-v2", device="cpu"):
+    drive.mount('/content/drive')
+    #DB_DIR = "/content/drive/My Drive/hybrid_wiki_index"
+
+    FAISS_PATH = os.path.join(db_dir, "faiss_index")
+
+
+    os.makedirs(FAISS_PATH, exist_ok=True)
+
+    if device == "cpu":
+        embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': "cpu"})
+    else:
+        embeddings = HuggingFaceEmbeddings(model_name=embedding_model, model_kwargs={'device': device})
+
+    # --- MAIN LOOP ---
+    state = get_state(db_dir)
+    current_idx = state["last_index"]
+
+    print(f"Resuming from index: {current_idx}")
+
+    # Load Dataset
+    ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
+                    "simple", split="train", streaming=True)
+    it = iter(ds)
+    for _ in range(current_idx): next(it)
+
+    if total_target is None:
+        total_target = 1000000000000
+
+    while current_idx < total_target:
+        batch_docs = []
+        batch_texts = []
+        
+        for _ in range(batch_size):
+            try:
+                entry = next(it)
+                doc = Document(page_content=entry['text'], metadata={"title": entry['title']})
+                batch_docs.append(doc)
+                batch_texts.append(entry['text'])
+            except StopIteration: break
+        
+        if not batch_docs: 
+            break
+
+        print(f"--- Processing Batch: {current_idx} to {current_idx + len(batch_docs)} ---")
+        
+        # 1. Update FAISS (Dense)
+        new_faiss = FAISS.from_documents(batch_docs, embeddings)
+        if os.path.exists(os.path.join(FAISS_PATH, "index.faiss")):
+            vector_db = FAISS.load_local(FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+            vector_db.merge_from(new_faiss)
+            vector_db.save_local(FAISS_PATH)
+        else:
+            new_faiss.save_local(FAISS_PATH)
+
+
+        current_idx += len(batch_docs)
+        save_state(db_dir, current_idx, []) 
+        print(f"Success. Total docs in FAISS Store: {current_idx}")
+
+    print("\nAll indices built and saved to Drive.")
+
     
 def build_bm25_database(db_dir, total_target = None, build_bm25=True, batch_size=5000):
     drive.mount('/content/drive')

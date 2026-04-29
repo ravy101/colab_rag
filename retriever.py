@@ -91,6 +91,6 @@ def consolidate_context(retrieval_results, threshold = 0.15):
         header = f"[Source {i+1} | RRF Score: {score:.4f}]"
         block = f"{header}\n{doc.page_content.strip()}"
         context_blocks.append(block)
-    prefix = "Potentially related snippets. If the answer does "
-    return "\n\n".join(context_blocks)
+    prefix = "Supporting context sources may or may not contain the required information.\n"
+    return prefix + "\n\n".join(context_blocks)
 

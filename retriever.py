@@ -76,7 +76,7 @@ class SimpleHybridRetriever:
             
         return final_output
 
-def consolidate_context(retrieval_results, threshold = 0):
+def consolidate_context(retrieval_results, threshold = 0.15):
     """
     Consolidates RRF results into a single string for LLM prompting.
     """
@@ -91,6 +91,6 @@ def consolidate_context(retrieval_results, threshold = 0):
         header = f"[Source {i+1} | RRF Score: {score:.4f}]"
         block = f"{header}\n{doc.page_content.strip()}"
         context_blocks.append(block)
-
+    prefix = "Potentially related snippets. If the answer does "
     return "\n\n".join(context_blocks)
 

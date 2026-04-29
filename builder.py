@@ -94,7 +94,7 @@ def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=Tru
                 old_retriever = bm25s.BM25.load(BM25_PATH, load_corpus=True)
                 
                 if old_retriever.corpus is not None:
-                    current_corpus = list(old_retriever.corpus)
+                    current_corpus = [c['text'] for c in list(old_retriever.corpus)]
                     print(f"Resumed: Loaded {len(current_corpus)} documents from BM25.")
                 else:
                     print("Index found but corpus is empty. Starting fresh.")
@@ -181,7 +181,7 @@ def build_bm25_database(db_dir, total_target = None, build_bm25=True, batch_size
                 old_retriever = bm25s.BM25.load(BM25_PATH, load_corpus=True)
                 
                 if old_retriever.corpus is not None:
-                    current_corpus = list(old_retriever.corpus)
+                    current_corpus = [c['text'] for c in list(old_retriever.corpus)]
                     print(f"Resumed: Loaded {len(current_corpus)} documents from BM25.")
                 else:
                     print("Index found but corpus is empty. Starting fresh.")

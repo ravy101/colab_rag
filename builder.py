@@ -23,7 +23,7 @@ def save_state(db_dir, idx, doc_ids, tag = ""):
     with open(STATE_FILE, 'w') as f:
         json.dump({"last_index": idx, "doc_ids": doc_ids}, f)
 
-def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=True, batch_size=5000, embedding_model= "sentence-transformers/all-MiniLM-L6-v2", device="cpu"):
+def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=True, batch_size=5000, hf_dataset= None, embedding_model= "sentence-transformers/all-MiniLM-L6-v2", device="cpu"):
     drive.mount('/content/drive')
     #DB_DIR = "/content/drive/My Drive/hybrid_wiki_index"
 
@@ -49,8 +49,11 @@ def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=Tru
     print(f"Resuming from index: {current_idx}")
 
     # Load Dataset
-    ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
-                    "simple", split="train", streaming=True)
+    if hf_dataset:
+        df = hf_dataset
+    else:
+        ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
+                        "simple", split="train", streaming=True)
     it = iter(ds)
     for _ in range(current_idx): next(it)
 
@@ -125,7 +128,7 @@ def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=Tru
     print("\nAll indices built and saved to Drive.")
 
 
-def build_faiss_database(db_dir, total_target = None, batch_size=5000, embedding_model= "sentence-transformers/all-MiniLM-L6-v2", device="cpu"):
+def build_faiss_database(db_dir, total_target = None, batch_size=5000, hf_dataset= None, embedding_model= "sentence-transformers/all-MiniLM-L6-v2", device="cpu"):
     drive.mount('/content/drive')
     #DB_DIR = "/content/drive/My Drive/hybrid_wiki_index"
 
@@ -146,8 +149,12 @@ def build_faiss_database(db_dir, total_target = None, batch_size=5000, embedding
     print(f"Resuming from index: {current_idx}")
 
     # Load Dataset
-    ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
-                    "simple", split="train", streaming=True)
+    if hf_dataset:
+        df = hf_dataset
+    else:
+        ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
+                        "simple", split="train", streaming=True)
+        
     it = iter(ds)
     for _ in range(current_idx): next(it)
 
@@ -188,7 +195,7 @@ def build_faiss_database(db_dir, total_target = None, batch_size=5000, embedding
     print("\nAll indices built and saved to Drive.")
 
     
-def build_bm25_database(db_dir, total_target = None, build_bm25=True, batch_size=5000):
+def build_bm25_database(db_dir, total_target = None, build_bm25=True, batch_size=5000, hf_dataset= None):
     drive.mount('/content/drive')
    
     BM25_PATH = os.path.join(db_dir, "bm25s_index")
@@ -205,8 +212,11 @@ def build_bm25_database(db_dir, total_target = None, build_bm25=True, batch_size
     print(f"Resuming from index: {current_idx}")
 
     # Load Dataset
-    ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
-                    "simple", split="train", streaming=True)
+    if hf_dataset:
+        df = hf_dataset
+    else:
+        ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
+                        "simple", split="train", streaming=True)
     it = iter(ds)
     for _ in range(current_idx): next(it)
 

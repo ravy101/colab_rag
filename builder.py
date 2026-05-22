@@ -23,7 +23,7 @@ def save_state(db_dir, idx, doc_ids, tag = ""):
     with open(STATE_FILE, 'w') as f:
         json.dump({"last_index": idx, "doc_ids": doc_ids}, f)
 
-def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=True, batch_size=5000, hf_dataset= None, embedding_model= "sentence-transformers/all-MiniLM-L6-v2", device="cpu"):
+def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=True, batch_size=5000, hf_dataset= None, text_field = 'content',embedding_model= "sentence-transformers/all-MiniLM-L6-v2", device="cpu"):
     drive.mount('/content/drive')
     #DB_DIR = "/content/drive/My Drive/hybrid_wiki_index"
 
@@ -67,9 +67,9 @@ def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=Tru
         for _ in range(batch_size):
             try:
                 entry = next(it)
-                doc = Document(page_content=entry['text'], metadata={"title": entry['title']})
+                doc = Document(page_content=entry[text_field], metadata={"title": entry['title']})
                 batch_docs.append(doc)
-                batch_texts.append(entry['text'])
+                batch_texts.append(entry[text_field])
             except StopIteration: break
         
         if not batch_docs: 
@@ -128,7 +128,7 @@ def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=Tru
     print("\nAll indices built and saved to Drive.")
 
 
-def build_faiss_database(db_dir, total_target = None, batch_size=5000, hf_dataset= None, embedding_model= "sentence-transformers/all-MiniLM-L6-v2", device="cpu"):
+def build_faiss_database(db_dir, total_target = None, batch_size=5000, hf_dataset= None, text_field = 'content', embedding_model= "sentence-transformers/all-MiniLM-L6-v2", device="cpu"):
     drive.mount('/content/drive')
     #DB_DIR = "/content/drive/My Drive/hybrid_wiki_index"
 
@@ -168,9 +168,9 @@ def build_faiss_database(db_dir, total_target = None, batch_size=5000, hf_datase
         for _ in range(batch_size):
             try:
                 entry = next(it)
-                doc = Document(page_content=entry['text'], metadata={"title": entry['title']})
+                doc = Document(page_content=entry[text_field], metadata={"title": entry['title']})
                 batch_docs.append(doc)
-                batch_texts.append(entry['text'])
+                batch_texts.append(entry[text_field])
             except StopIteration: break
         
         if not batch_docs: 
@@ -195,7 +195,7 @@ def build_faiss_database(db_dir, total_target = None, batch_size=5000, hf_datase
     print("\nAll indices built and saved to Drive.")
 
     
-def build_bm25_database(db_dir, total_target = None, build_bm25=True, batch_size=5000, hf_dataset= None):
+def build_bm25_database(db_dir, total_target = None, build_bm25=True, batch_size=5000, hf_dataset= None, text_field = 'content'):
     drive.mount('/content/drive')
    
     BM25_PATH = os.path.join(db_dir, "bm25s_index")
@@ -230,9 +230,9 @@ def build_bm25_database(db_dir, total_target = None, build_bm25=True, batch_size
         for _ in range(batch_size):
             try:
                 entry = next(it)
-                doc = Document(page_content=entry['text'], metadata={"title": entry['title']})
+                doc = Document(page_content=entry[text_field], metadata={"title": entry['title']})
                 batch_docs.append(doc)
-                batch_texts.append(entry['text'])
+                batch_texts.append(entry[text_field])
             except StopIteration: 
                 break
         

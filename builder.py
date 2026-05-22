@@ -50,7 +50,7 @@ def build_database(db_dir, total_target = None, build_faiss=True, build_bm25=Tru
 
     # Load Dataset
     if hf_dataset:
-        df = hf_dataset
+        ds = hf_dataset
     else:
         ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
                         "simple", split="train", streaming=True)
@@ -150,7 +150,7 @@ def build_faiss_database(db_dir, total_target = None, batch_size=5000, hf_datase
 
     # Load Dataset
     if hf_dataset:
-        df = hf_dataset
+        ds = hf_dataset
     else:
         ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
                         "simple", split="train", streaming=True)
@@ -213,7 +213,7 @@ def build_bm25_database(db_dir, total_target = None, build_bm25=True, batch_size
 
     # Load Dataset
     if hf_dataset:
-        df = hf_dataset
+        ds = hf_dataset
     else:
         ds = load_dataset("CohereLabs/wikipedia-2023-11-embed-multilingual-v3-int8-binary", 
                         "simple", split="train", streaming=True)

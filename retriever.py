@@ -166,7 +166,7 @@ class SimpleHybridRetriever:
         ]
 
 
-def mcqa_hybrid_retrieve(retriever, question, choices, k=5, k_per_choice=3):
+def mcqa_hybrid_retrieve(self, question, choices, k=5, k_per_choice=3):
     """
     Per-choice MCQA retrieval with cross-choice deduplication.
     Returns top-k unique chunks across all choice-conditioned queries.
@@ -174,7 +174,7 @@ def mcqa_hybrid_retrieve(retriever, question, choices, k=5, k_per_choice=3):
     all_results = {}
     for choice in choices:
         query = f"{question} {choice}"
-        for r in retriever.hybrid_retrieve(query, k=k_per_choice):
+        for r in self.hybrid_retrieve(query, k=k_per_choice):
             meta = r['doc'].metadata
             key = (meta.get('article_idx', -1), meta.get('chunk_idx', -1))
             if key == (-1, -1):

@@ -27,7 +27,11 @@ from Stemmer import Stemmer
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:  # fallback for older langchain installs
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 
 try:
     from google.colab import drive

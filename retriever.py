@@ -166,24 +166,24 @@ class SimpleHybridRetriever:
         ]
 
 
-def mcqa_hybrid_retrieve(self, question, choices, k=5, k_per_choice=3):
-    """
-    Per-choice MCQA retrieval with cross-choice deduplication.
-    Returns top-k unique chunks across all choice-conditioned queries.
-    """
-    all_results = {}
-    for choice in choices:
-        query = f"{question} {choice}"
-        for r in self.hybrid_retrieve(query, k=k_per_choice):
-            meta = r['doc'].metadata
-            key = (meta.get('article_idx', -1), meta.get('chunk_idx', -1))
-            if key == (-1, -1):
-                key = ('txt', r['doc'].page_content[:200])
-            if key not in all_results or r['score'] > all_results[key]['score']:
-                all_results[key] = r
-    return sorted(all_results.values(),
-                  key=lambda x: x['score'],
-                  reverse=True)[:k]
+    def mcqa_hybrid_retrieve(self, question, choices, k=5, k_per_choice=3):
+        """
+        Per-choice MCQA retrieval with cross-choice deduplication.
+        Returns top-k unique chunks across all choice-conditioned queries.
+        """
+        all_results = {}
+        for choice in choices:
+            query = f"{question} {choice}"
+            for r in self.hybrid_retrieve(query, k=k_per_choice):
+                meta = r['doc'].metadata
+                key = (meta.get('article_idx', -1), meta.get('chunk_idx', -1))
+                if key == (-1, -1):
+                    key = ('txt', r['doc'].page_content[:200])
+                if key not in all_results or r['score'] > all_results[key]['score']:
+                    all_results[key] = r
+        return sorted(all_results.values(),
+                    key=lambda x: x['score'],
+                    reverse=True)[:k]
 
 def consolidate_context(retrieval_results, threshold=0.015):
     """

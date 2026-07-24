@@ -97,6 +97,14 @@ def _iter_chunks(entry, splitter, text_field, title_field, min_chunk_chars):
         yield chunk, title, i
 
 
+def _count_corpus_chunks(corpus_path):
+    n = 0
+    with open(corpus_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                n += 1
+    return n
+
 
 # --- BM25 BUILDER ---
 
@@ -222,8 +230,17 @@ def build_bm25_database(
     return n_total
 
 
+import gc
+
 def _build_bm25_index_from_corpus(corpus_path, bm25_path, stemmer):
-    """Read JSONL corpus and build a fresh BM25 index in one pass."""
+    """Read JSONL corpus and build a fresh BM25 index in one pass.
+
+    Memory notes: we avoid holding a second full copy of the corpus text.
+    `corpus_records` is retained because it is saved as the retrievable
+    corpus, but tokenisation streams from a generator rather than a
+    materialised `texts` list, and large intermediates are freed before
+    the index matrix is built (peak = tokens + index coexisting).
+    """
     if not os.path.exists(corpus_path):
         raise FileNotFoundError(f"Corpus file not found: {corpus_path}")
 
@@ -233,21 +250,26 @@ def _build_bm25_index_from_corpus(corpus_path, bm25_path, stemmer):
             line = line.strip()
             if not line:
                 continue
-            rec = json.loads(line)
-            corpus_records.append(rec)
+            corpus_records.append(json.loads(line))
 
     if not corpus_records:
         raise RuntimeError("Empty corpus; nothing to index.")
 
-    texts = [r["text"] for r in corpus_records]
-    print(f"Tokenising {len(texts)} chunks...")
-    tokens = bm25s.tokenize(texts, stemmer=stemmer)
+    print(f"Tokenising {len(corpus_records)} chunks...")
+    # Stream text into the tokeniser instead of building a second full list.
+    tokens = bm25s.tokenize(
+        (r["text"] for r in corpus_records),
+        stemmer=stemmer,
+    )
 
     print("Indexing...")
-    # bm25s preserves whatever you pass as `corpus` and returns it on retrieve.
     # We pass the full record dict so retrieval has metadata available.
     retriever = bm25s.BM25(corpus=corpus_records)
     retriever.index(tokens)
+
+    # tokens is dead once the index is built; free before save.
+    del tokens
+    gc.collect()
 
     # Clean overwrite of the index dir
     if os.path.exists(bm25_path):
@@ -255,7 +277,10 @@ def _build_bm25_index_from_corpus(corpus_path, bm25_path, stemmer):
     os.makedirs(bm25_path, exist_ok=True)
     retriever.save(bm25_path, corpus=corpus_records)
 
-    return len(corpus_records)
+    n = len(corpus_records)
+    del corpus_records, retriever
+    gc.collect()
+    return n
 
 
 
@@ -290,8 +315,7 @@ def build_faiss_database(
 
     Args:
         db_dir: Output directory.
-        total_target: Max articles (when streaming) or chunks (when reusing
-                      JSONL). None = all.
+        total_target: Max number of *articles* to process (None = all).
         batch_size: Items per FAISS add + checkpoint.
         hf_dataset: Pre-loaded HF dataset, or None for wikimedia/wikipedia.
         text_field, title_field: Field names in the source dataset.
@@ -376,7 +400,7 @@ def _build_faiss_from_jsonl(
     save_every_n_batches,
 ):
     state = get_state(db_dir, tag="faiss_")
-    start_chunk_idx = state.get("last_article_index", 0)
+    start_chunk_idx = state.get("last_article_index", 0)  # still a chunk offset on disk; see note
     n_indexed = state.get("n_chunks_written", 0)
     print(
         f"Resuming FAISS from chunk {start_chunk_idx} "
@@ -394,7 +418,7 @@ def _build_faiss_from_jsonl(
 
     batch_docs = []
     batches_since_save = 0
-    current_idx = 0
+    current_idx = 0  # chunk counter (line number), used only for resume position
 
     with open(corpus_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -404,10 +428,13 @@ def _build_faiss_from_jsonl(
             if current_idx < start_chunk_idx:
                 current_idx += 1
                 continue
-            if current_idx >= total_target:
-                break
 
             rec = json.loads(line)
+
+            # Gate on ARTICLE index, so total_target means articles here too.
+            if rec.get("article_idx", -1) >= total_target:
+                break
+
             batch_docs.append(
                 Document(
                     page_content=rec["text"],

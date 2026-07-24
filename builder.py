@@ -232,14 +232,16 @@ def build_bm25_database(
 
 import gc
 
-def _build_bm25_index_from_corpus(corpus_path, bm25_path, stemmer):
-    """Read JSONL corpus and build a fresh BM25 index in one pass.
+def _build_bm25_index_from_corpus(
+    corpus_path, bm25_path, stemmer, shard_size=2_000_000
+):
+    """Build a BM25 index with sharded tokenisation (bm25s 0.3.10).
 
-    Memory notes: we avoid holding a second full copy of the corpus text.
-    `corpus_records` is retained because it is saved as the retrievable
-    corpus, but tokenisation streams from a generator rather than a
-    materialised `texts` list, and large intermediates are freed before
-    the index matrix is built (peak = tokens + index coexisting).
+    bm25s.tokenize has no shared-vocab argument, so each shard is
+    tokenised independently and its local token ids are remapped into a
+    single global vocab before the id lists are concatenated. Indexes
+    once at the end (no O(N^2) re-indexing). Output is a single index
+    dir, load-compatible with the retriever's BM25.load(load_corpus=True).
     """
     if not os.path.exists(corpus_path):
         raise FileNotFoundError(f"Corpus file not found: {corpus_path}")
@@ -255,33 +257,58 @@ def _build_bm25_index_from_corpus(corpus_path, bm25_path, stemmer):
     if not corpus_records:
         raise RuntimeError("Empty corpus; nothing to index.")
 
-    print(f"Tokenising {len(corpus_records)} chunks...")
-    # Stream text into the tokeniser instead of building a second full list.
-    tokens = bm25s.tokenize(
-        (r["text"] for r in corpus_records),
-        stemmer=stemmer,
-    )
+    n = len(corpus_records)
+    print(f"Tokenising {n} chunks in shards of {shard_size}...")
 
-    print("Indexing...")
-    # We pass the full record dict so retrieval has metadata available.
+    global_vocab = {}          # token string -> global id
+    all_ids = []               # list of per-doc lists of global ids
+
+    for start in range(0, n, shard_size):
+        end = min(start + shard_size, n)
+        shard_texts = [r["text"] for r in corpus_records[start:end]]
+
+        tok = bm25s.tokenize(
+            shard_texts,
+            stemmer=stemmer,
+            return_ids=True,
+            show_progress=False,
+        )
+        # tok.vocab: token -> local_id ; tok.ids: list of lists of local ids
+        local_id_to_token = {v: k for k, v in tok.vocab.items()}
+
+        # Build a local->global id translation for this shard's vocab.
+        local_to_global = {}
+        for token, local_id in tok.vocab.items():
+            g = global_vocab.get(token)
+            if g is None:
+                g = len(global_vocab)
+                global_vocab[token] = g
+            local_to_global[local_id] = g
+
+        # Remap this shard's doc-id-lists into global ids.
+        for doc_ids in tok.ids:
+            all_ids.append([local_to_global[i] for i in doc_ids])
+
+        del shard_texts, tok, local_id_to_token, local_to_global
+        gc.collect()
+        print(f"  tokenised {end}/{n}  (vocab size {len(global_vocab)})")
+
+    print("Indexing (single pass)...")
+    tokens = bm25s.tokenization.Tokenized(ids=all_ids, vocab=global_vocab)
     retriever = bm25s.BM25(corpus=corpus_records)
     retriever.index(tokens)
 
-    # tokens is dead once the index is built; free before save.
-    del tokens
+    del all_ids, tokens, global_vocab
     gc.collect()
 
-    # Clean overwrite of the index dir
     if os.path.exists(bm25_path):
         shutil.rmtree(bm25_path)
     os.makedirs(bm25_path, exist_ok=True)
     retriever.save(bm25_path, corpus=corpus_records)
 
-    n = len(corpus_records)
     del corpus_records, retriever
     gc.collect()
     return n
-
 
 
 # --- FAISS BUILDER ---

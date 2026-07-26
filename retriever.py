@@ -68,6 +68,8 @@ class SimpleHybridRetriever:
         bm25s_path=None,
         device="cpu",
         mount_drive=True,
+        bm25_mmap = False,
+        faiss_mmap = False,
     ):
         if mount_drive and _IN_COLAB:
             drive.mount("/content/drive")
@@ -93,7 +95,7 @@ class SimpleHybridRetriever:
 
         if bm25s_path:
             self.retriever_bm25 = bm25s.BM25.load(
-                bm25s_path, load_corpus=True
+                bm25s_path, load_corpus=True, mmap=bm25_mmap
             )
             corpus_n = (
                 len(self.retriever_bm25.corpus)

@@ -371,6 +371,70 @@ def _build_bm25_index_from_corpus(corpus_path, bm25_path, stemmer):
     return n
 
 
+
+def build_bm25_sharded(corpus_path, bm25_root, shard_chunks=2000000):
+    """Build BM25 as independent, resumable shards over an existing corpus.
+
+    Each shard is a complete bm25s index over `shard_chunks` consecutive
+    corpus lines, saved immediately. Existing shards are skipped, so a
+    crash/disconnect only costs the in-progress shard. No monolithic
+    in-memory matrix, so peak RAM is bounded by one shard.
+    """
+    import os, json, shutil, bm25s
+    from Stemmer import Stemmer
+
+    stemmer = Stemmer("english")
+    os.makedirs(bm25_root, exist_ok=True)
+
+    def shard_dir(i):
+        return os.path.join(bm25_root, f"shard_{i:04d}")
+
+    def _done(i):
+        # a shard is complete only if its data array was actually written
+        d = shard_dir(i)
+        p = os.path.join(d, "data.csc.index.npy")
+        return os.path.exists(p) and os.path.getsize(p) > 1024
+
+    shard_i = 0
+    buf = []
+
+    def flush(idx, records):
+        d = shard_dir(idx)
+        if _done(idx):
+            print(f"  shard {idx} already complete, skipping")
+            return
+        if os.path.exists(d):
+            shutil.rmtree(d)  # remove any partial/truncated shard
+        os.makedirs(d, exist_ok=True)
+        texts = [r["text"] for r in records]
+        tokens = bm25s.tokenize(texts, stemmer=stemmer, show_progress=False)
+        r = bm25s.BM25(corpus=records)
+        r.index(tokens)
+        r.save(d, corpus=records)
+        print(f"  shard {idx} saved: {len(records)} chunks -> {d}")
+
+    with open(corpus_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            buf.append(json.loads(line))
+            if len(buf) >= shard_chunks:
+                if not _done(shard_i):
+                    flush(shard_i, buf)
+                else:
+                    print(f"  shard {shard_i} already complete, skipping")
+                buf = []
+                shard_i += 1
+
+    if buf:  # final partial shard
+        if not _done(shard_i):
+            flush(shard_i, buf)
+        shard_i += 1
+
+    print(f"Done. {shard_i} shards at {bm25_root}")
+    return shard_i
+
 # --- FAISS BUILDER ---
 
 def build_faiss_database(

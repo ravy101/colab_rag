@@ -584,9 +584,10 @@ def _build_faiss_from_jsonl(
     batch_size,
     total_target,
     save_every_n_batches,
+    backup_every=2_000_000,
 ):
     state = get_state(db_dir, tag="faiss_")
-    start_chunk_idx = state.get("last_article_index", 0)  # still a chunk offset on disk; see note
+    start_chunk_idx = state.get("last_article_index", 0)  # chunk offset on disk
     n_indexed = state.get("n_chunks_written", 0)
     print(
         f"Resuming FAISS from chunk {start_chunk_idx} "
@@ -604,7 +605,8 @@ def _build_faiss_from_jsonl(
 
     batch_docs = []
     batches_since_save = 0
-    current_idx = 0  # chunk counter (line number), used only for resume position
+    last_backup_at = n_indexed
+    current_idx = 0  # chunk counter (line number), used for resume position
 
     with open(corpus_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -650,6 +652,14 @@ def _build_faiss_from_jsonl(
                     else batches_since_save + 1
                 )
 
+                # Periodic verified single-slot backup.
+                if n_indexed - last_backup_at >= backup_every:
+                    if vector_db is not None:
+                        vector_db.save_local(faiss_path)
+                        if _verify_faiss(faiss_path, embeddings):
+                            _refresh_faiss_backup(faiss_path, db_dir)
+                            last_backup_at = n_indexed
+
     # Flush trailing batch
     if batch_docs:
         vector_db = _flush_faiss_batch(
@@ -660,6 +670,10 @@ def _build_faiss_from_jsonl(
 
     if vector_db is not None:
         vector_db.save_local(faiss_path)
+        # Final backup so the last stretch is protected too.
+        if _verify_faiss(faiss_path, embeddings):
+            _refresh_faiss_backup(faiss_path, db_dir)
+
     print(f"\nFAISS done. {n_indexed} chunks indexed at {faiss_path}")
     return n_indexed
 

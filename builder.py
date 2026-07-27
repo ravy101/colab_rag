@@ -309,66 +309,65 @@ import gc
 #     del corpus_records, retriever
 #     gc.collect()
 #     return n
+class _TokenizedCorpus:
+    """Re-iterable stream of token-string lists, one per corpus line.
 
-def _build_bm25_index_from_corpus(corpus_path, bm25_path, stemmer):
-    """Build a BM25 index without holding the corpus or token ids in RAM.
-
-    Streams token-string lists into BM25.index() (which builds the vocab
-    itself, so no cross-shard id remap is needed), and streams corpus
-    records into BM25.save() from the JSONL on disk. Peak RAM is bounded
-    by the vocab + sparse index matrix, not by the full corpus.
-
-    Output is load-compatible with the retriever's
-    BM25.load(..., load_corpus=True) [2]; query at scale with mmap=True.
+    Re-opens the JSONL and re-tokenises on every __iter__, so bm25s can
+    iterate it more than once (vocab pass + postings pass) without us
+    holding the whole tokenised corpus in RAM. This is what a bare
+    generator could not do — a generator is exhausted after one pass,
+    which produced the empty score matrix.
     """
-    if not os.path.exists(corpus_path):
-        raise FileNotFoundError(f"Corpus file not found: {corpus_path}")
+    def __init__(self, corpus_path, stemmer):
+        self.corpus_path = corpus_path
+        self.stemmer = stemmer
 
-    # Count once (cheap: one streaming pass, nothing retained).
-    n = 0
-    with open(corpus_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                n += 1
-    if n == 0:
-        raise RuntimeError("Empty corpus; nothing to index.")
-
-    print(f"Streaming-tokenising and indexing {n} chunks...")
-
-    def _token_stream():
-        # Yields one list-of-token-strings per document.
-        with open(corpus_path, "r", encoding="utf-8") as f:
+    def __iter__(self):
+        with open(self.corpus_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 text = json.loads(line)["text"]
                 tok = bm25s.tokenize(
-                    text,
-                    stemmer=stemmer,
-                    return_ids=False,      # token STRINGS, not ids
-                    show_progress=False,
+                    text, stemmer=self.stemmer,
+                    return_ids=False, show_progress=False,
                 )
-                # tokenize(single str) -> list with one doc's token list
-                yield tok[0]
+                yield tok[0]   # one document's token-string list
 
-    def _corpus_stream():
-        # Yields the record dicts for save(), read straight off disk.
-        with open(corpus_path, "r", encoding="utf-8") as f:
+
+class _CorpusRecords:
+    """Re-iterable stream of record dicts for BM25.save(corpus=...)."""
+    def __init__(self, corpus_path):
+        self.corpus_path = corpus_path
+
+    def __iter__(self):
+        with open(self.corpus_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 yield json.loads(line)
 
+
+def _build_bm25_index_from_corpus(corpus_path, bm25_path, stemmer):
+    if not os.path.exists(corpus_path):
+        raise FileNotFoundError(f"Corpus file not found: {corpus_path}")
+
+    print("Indexing BM25 from re-iterable token stream...")
     retriever = bm25s.BM25()
-    retriever.index(_token_stream(), show_progress=True)
+    retriever.index(_TokenizedCorpus(corpus_path, stemmer))
 
     if os.path.exists(bm25_path):
         shutil.rmtree(bm25_path)
     os.makedirs(bm25_path, exist_ok=True)
-    retriever.save(bm25_path, corpus=_corpus_stream())
+    retriever.save(bm25_path, corpus=_CorpusRecords(corpus_path))
 
+    n = 0
+    with open(corpus_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                n += 1
     return n
 
 

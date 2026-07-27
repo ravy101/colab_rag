@@ -232,6 +232,41 @@ def build_bm25_database(
 
 import gc
 
+def _verify_faiss(faiss_path, embeddings):
+    """True only if the primary index loads and its docstore is readable."""
+    try:
+        vdb = FAISS.load_local(
+            faiss_path, embeddings, allow_dangerous_deserialization=True
+        )
+        _ = len(vdb.index_to_docstore_id)
+        return True
+    except Exception as e:
+        print(f"  BACKUP SKIPPED — primary failed verify: {e}")
+        return False
+
+
+def _refresh_faiss_backup(faiss_path, db_dir):
+    """Atomically replace the single backup slot with the current index.
+
+    Copies primary -> tmp, snapshots progress into tmp, then swaps tmp into
+    the backup slot. A crash mid-copy leaves the previous backup intact.
+    """
+    backup_dir = os.path.join(db_dir, "faiss_index_backup")
+    backup_tmp = os.path.join(db_dir, "faiss_index_backup_tmp")
+    progress_src = os.path.join(db_dir, "faiss_progress.json")
+
+    if os.path.exists(backup_tmp):
+        shutil.rmtree(backup_tmp)
+    shutil.copytree(faiss_path, backup_tmp)
+    if os.path.exists(progress_src):
+        shutil.copy2(
+            progress_src, os.path.join(backup_tmp, "faiss_progress.json")
+        )
+    if os.path.exists(backup_dir):
+        shutil.rmtree(backup_dir)
+    os.rename(backup_tmp, backup_dir)
+    print(f"  backup refreshed -> {backup_dir}")
+
 # def _build_bm25_index_from_corpus(
 #     corpus_path, bm25_path, stemmer, shard_size=2_000_000
 # ):
@@ -654,6 +689,7 @@ def _build_faiss_from_stream(
     batch_size,
     total_target,
     save_every_n_batches,
+    backup_every=2_000_000,
 ):
     splitter = _make_splitter(chunk_size, chunk_overlap)
 
@@ -684,6 +720,7 @@ def _build_faiss_from_stream(
         )
 
     batches_since_save = 0
+    last_backup_at = n_chunks_indexed
     with open(corpus_path, "a", encoding="utf-8") as corpus_f:
         while current_article_idx < total_target:
             batch_docs = []
@@ -746,6 +783,14 @@ def _build_faiss_from_stream(
                 f"chunks indexed {n_chunks_indexed} "
                 f"(+{len(batch_docs)} this batch)"
             )
+
+            # Periodic verified single-slot backup.
+            if n_chunks_indexed - last_backup_at >= backup_every:
+                if vector_db is not None:
+                    vector_db.save_local(faiss_path)
+                    if _verify_faiss(faiss_path, embeddings):
+                        _refresh_faiss_backup(faiss_path, db_dir)
+                        last_backup_at = n_chunks_indexed
 
     if vector_db is not None:
         vector_db.save_local(faiss_path)

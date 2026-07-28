@@ -270,6 +270,19 @@ import gc
 import pickle
 import faiss
 
+import time
+
+def _verify_with_retry(path, expected_n, attempts=4, delay=5):
+    for i in range(attempts):
+        ok, ntotal, reason = _verify_faiss(path, expected_n=expected_n)
+        if ok:
+            return True, ntotal, reason
+        if i < attempts - 1:
+            print(f"  verify attempt {i+1} failed ({reason}); "
+                  f"waiting {delay}s for Drive to settle...")
+            time.sleep(delay)
+    return False, ntotal, reason
+
 def _faiss_vector_dim(embedding_model_or_dim=384):
     """Dimensionality of the embedding vectors. all-MiniLM-L6-v2 is 384."""
     return embedding_model_or_dim
@@ -334,11 +347,16 @@ def _verify_faiss(faiss_path, expected_n=None, embeddings=None):
     return True, ntotal, "ok"
 
 
-def _refresh_faiss_backup(faiss_path, db_dir, expected_n):
-    """Copy the (already-verified) primary to the single backup slot,
-    then RE-VERIFY the copy before swapping it in. A truncated copy over
-    Drive can never replace a good backup, because the swap only happens
-    if the copied files read back consistently.
+import time
+
+def _refresh_faiss_backup(faiss_path, db_dir, expected_n,
+                          verify_attempts=5, verify_delay=8):
+    """Copy the primary to the single backup slot, then RE-VERIFY the copy
+    with retries before swapping. Handles the Drive flush race: a freshly
+    copied index.faiss may not be fully visible to a read immediately, so
+    we retry verification (with delay) before concluding it's truncated.
+    A genuinely bad copy still fails all attempts and aborts, leaving the
+    previous backup intact.
     """
     backup_dir = os.path.join(db_dir, "faiss_index_backup")
     backup_tmp = os.path.join(db_dir, "faiss_index_backup_tmp")
@@ -351,10 +369,18 @@ def _refresh_faiss_backup(faiss_path, db_dir, expected_n):
         shutil.copy2(progress_src,
                      os.path.join(backup_tmp, "faiss_progress.json"))
 
-    # Re-verify the COPY, not the source. This is the check that was missing.
-    ok, ntotal, reason = _verify_faiss(backup_tmp, expected_n=expected_n)
+    ok, ntotal, reason = (False, 0, "not attempted")
+    for i in range(verify_attempts):
+        ok, ntotal, reason = _verify_faiss(backup_tmp, expected_n=expected_n)
+        if ok:
+            break
+        if i < verify_attempts - 1:
+            print(f"  backup verify attempt {i+1}/{verify_attempts} failed "
+                  f"({reason}); waiting {verify_delay}s for Drive to flush...")
+            time.sleep(verify_delay)
+
     if not ok:
-        print(f"  BACKUP ABORTED — copied files failed verify: {reason}. "
+        print(f"  BACKUP ABORTED after {verify_attempts} attempts: {reason}. "
               f"Previous backup left intact.")
         shutil.rmtree(backup_tmp, ignore_errors=True)
         return False

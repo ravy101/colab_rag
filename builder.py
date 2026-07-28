@@ -106,36 +106,41 @@ def _count_corpus_chunks(corpus_path):
     return n
 
 def _restore_faiss_from_backup(faiss_path, db_dir):
-    """Replace the primary index + progress with the verified backup.
+    """Restore the backup over the primary ONLY if the backup verifies.
 
-    Returns True if a usable backup was restored, False otherwise. Used
-    when resuming after a crash that may have truncated the primary
-    (e.g. an interrupted save_local over a Drive mount).
+    Refuses to destroy the primary unless the backup is proven consistent,
+    so a bad backup can't wipe a (possibly still-usable) primary. Returns
+    True if a verified backup was restored.
     """
     backup_dir = os.path.join(db_dir, "faiss_index_backup")
     backup_progress = os.path.join(backup_dir, "faiss_progress.json")
-    primary_progress = os.path.join(db_dir, "faiss_progress.json")
 
-    if not os.path.exists(os.path.join(backup_dir, "index.faiss")):
-        print("  no backup found; cannot restore. Starting from primary/scratch.")
+    # Determine the backup's own claimed chunk count for the cross-check.
+    expected_n = None
+    if os.path.exists(backup_progress):
+        try:
+            with open(backup_progress) as f:
+                expected_n = json.load(f).get("n_chunks_written")
+        except Exception:
+            expected_n = None
+
+    ok, ntotal, reason = _verify_faiss(backup_dir, expected_n=expected_n)
+    if not ok:
+        print(f"  REFUSING to restore — backup failed verify: {reason}. "
+              f"Primary left untouched.")
         return False
 
-    # Wipe possibly-truncated primary, replace with backup.
     if os.path.exists(faiss_path):
         shutil.rmtree(faiss_path)
     shutil.copytree(backup_dir, faiss_path)
-
-    # Restore the snapshotted progress so index + counter agree.
-    src = backup_progress if os.path.exists(backup_progress) else None
-    if src:
-        shutil.copy2(src, primary_progress)
-        # Remove the nested copy so it isn't mistaken for index data.
+    if os.path.exists(backup_progress):
+        shutil.copy2(backup_progress,
+                     os.path.join(db_dir, "faiss_progress.json"))
         nested = os.path.join(faiss_path, "faiss_progress.json")
         if os.path.exists(nested):
             os.remove(nested)
-    print(f"  restored primary index + progress from backup: {backup_dir}")
+    print(f"  restored verified backup ({ntotal} vectors) from {backup_dir}")
     return True
-
 
 # --- BM25 BUILDER ---
 
@@ -262,25 +267,78 @@ def build_bm25_database(
 
 
 import gc
+import pickle
+import faiss
 
-def _verify_faiss(faiss_path, embeddings):
-    """True only if the primary index loads and its docstore is readable."""
+def _faiss_vector_dim(embedding_model_or_dim=384):
+    """Dimensionality of the embedding vectors. all-MiniLM-L6-v2 is 384."""
+    return embedding_model_or_dim
+
+
+def _verify_faiss(faiss_path, expected_n=None, embeddings=None):
+    """Fully read an index and confirm internal consistency.
+
+    Reads index.faiss (real ntotal), index.pkl (docstore + id-map lengths),
+    and cross-checks them against each other and, if given, expected_n.
+    Returns (ok: bool, ntotal: int, reason: str). Does NOT trust file
+    existence or a shallow load -- it parses the actual contents, which is
+    what a size-only or docstore-only check failed to do.
+    """
+    idx_file = os.path.join(faiss_path, "index.faiss")
+    pkl_file = os.path.join(faiss_path, "index.pkl")
+
+    if not (os.path.exists(idx_file) and os.path.exists(pkl_file)):
+        return False, 0, "missing index.faiss or index.pkl"
+
+    # 1. Parse the vector file. A truncated file raises here.
     try:
-        vdb = FAISS.load_local(
-            faiss_path, embeddings, allow_dangerous_deserialization=True
-        )
-        _ = len(vdb.index_to_docstore_id)
-        return True
+        idx = faiss.read_index(idx_file)
+        ntotal = idx.ntotal
     except Exception as e:
-        print(f"  BACKUP SKIPPED — primary failed verify: {e}")
-        return False
+        return False, 0, f"index.faiss unreadable/truncated: {e}"
+
+    # 2. Load the pickle fully. A truncated pickle raises here.
+    try:
+        with open(pkl_file, "rb") as f:
+            obj = pickle.load(f)
+    except Exception as e:
+        return False, ntotal, f"index.pkl unreadable/truncated: {e}"
+
+    # 3. Extract docstore + id-map lengths (langchain saves a tuple).
+    docstore_len = None
+    idmap_len = None
+    try:
+        if isinstance(obj, tuple) and len(obj) == 2:
+            docstore, index_to_docstore_id = obj
+            idmap_len = len(index_to_docstore_id)
+            if hasattr(docstore, "_dict"):
+                docstore_len = len(docstore._dict)
+        else:
+            return False, ntotal, f"unexpected pkl shape: {type(obj)}"
+    except Exception as e:
+        return False, ntotal, f"pkl introspection failed: {e}"
+
+    # 4. Cross-check the three counts against each other.
+    if idmap_len != ntotal:
+        return (False, ntotal,
+                f"id-map len {idmap_len} != index ntotal {ntotal}")
+    if docstore_len is not None and docstore_len != ntotal:
+        return (False, ntotal,
+                f"docstore len {docstore_len} != index ntotal {ntotal}")
+
+    # 5. Cross-check against the caller's expected chunk count.
+    if expected_n is not None and ntotal != expected_n:
+        return (False, ntotal,
+                f"index ntotal {ntotal} != expected {expected_n}")
+
+    return True, ntotal, "ok"
 
 
-def _refresh_faiss_backup(faiss_path, db_dir):
-    """Atomically replace the single backup slot with the current index.
-
-    Copies primary -> tmp, snapshots progress into tmp, then swaps tmp into
-    the backup slot. A crash mid-copy leaves the previous backup intact.
+def _refresh_faiss_backup(faiss_path, db_dir, expected_n):
+    """Copy the (already-verified) primary to the single backup slot,
+    then RE-VERIFY the copy before swapping it in. A truncated copy over
+    Drive can never replace a good backup, because the swap only happens
+    if the copied files read back consistently.
     """
     backup_dir = os.path.join(db_dir, "faiss_index_backup")
     backup_tmp = os.path.join(db_dir, "faiss_index_backup_tmp")
@@ -290,14 +348,22 @@ def _refresh_faiss_backup(faiss_path, db_dir):
         shutil.rmtree(backup_tmp)
     shutil.copytree(faiss_path, backup_tmp)
     if os.path.exists(progress_src):
-        shutil.copy2(
-            progress_src, os.path.join(backup_tmp, "faiss_progress.json")
-        )
+        shutil.copy2(progress_src,
+                     os.path.join(backup_tmp, "faiss_progress.json"))
+
+    # Re-verify the COPY, not the source. This is the check that was missing.
+    ok, ntotal, reason = _verify_faiss(backup_tmp, expected_n=expected_n)
+    if not ok:
+        print(f"  BACKUP ABORTED — copied files failed verify: {reason}. "
+              f"Previous backup left intact.")
+        shutil.rmtree(backup_tmp, ignore_errors=True)
+        return False
+
     if os.path.exists(backup_dir):
         shutil.rmtree(backup_dir)
     os.rename(backup_tmp, backup_dir)
-    print(f"  backup refreshed -> {backup_dir}")
-
+    print(f"  backup refreshed and verified ({ntotal} vectors) -> {backup_dir}")
+    return True
 # def _build_bm25_index_from_corpus(
 #     corpus_path, bm25_path, stemmer, shard_size=2_000_000
 # ):
@@ -595,7 +661,7 @@ def _build_faiss_from_jsonl(
         _restore_faiss_from_backup(faiss_path, db_dir)
 
     state = get_state(db_dir, tag="faiss_")
-    start_chunk_idx = state.get("last_article_index", 0)  # chunk offset on disk
+    start_chunk_idx = state.get("last_article_index", 0)  # chunk offset here
     n_indexed = state.get("n_chunks_written", 0)
     print(
         f"Resuming FAISS from chunk {start_chunk_idx} "
@@ -607,6 +673,17 @@ def _build_faiss_from_jsonl(
 
     vector_db = None
     if os.path.exists(os.path.join(faiss_path, "index.faiss")):
+        # FAIL FAST: verify the primary matches the counter before resuming.
+        ok, ntotal, reason = _verify_faiss(
+            faiss_path, expected_n=n_indexed
+        )
+        if not ok:
+            raise RuntimeError(
+                f"Refusing to resume: primary index failed integrity check "
+                f"({reason}). On-disk vectors={ntotal}, progress claims "
+                f"{n_indexed}. Restore a verified backup "
+                f"(resume_from_backup=True) or reset state before rerunning."
+            )
         vector_db = FAISS.load_local(
             faiss_path, embeddings, allow_dangerous_deserialization=True
         )
@@ -614,7 +691,26 @@ def _build_faiss_from_jsonl(
     batch_docs = []
     batches_since_save = 0
     last_backup_at = n_indexed
-    current_idx = 0  # chunk counter (line number), used for resume position
+    current_idx = 0
+
+    def _flush_and_check(save_now):
+        nonlocal vector_db, n_indexed, batch_docs
+        vector_db = _flush_faiss_batch(
+            vector_db, batch_docs, embeddings, faiss_path, save=save_now
+        )
+        n_indexed += len(batch_docs)
+        save_state(db_dir, current_idx, n_indexed, tag="faiss_")
+        if save_now:
+            ok, ntotal, reason = _verify_faiss(
+                faiss_path, expected_n=n_indexed
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"Save integrity check FAILED after batch: {reason}. "
+                    f"Halting so the corrupt state is not extended. "
+                    f"Last good backup is untouched."
+                )
+        batch_docs = []
 
     with open(corpus_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -626,8 +722,6 @@ def _build_faiss_from_jsonl(
                 continue
 
             rec = json.loads(line)
-
-            # Gate on ARTICLE index, so total_target means articles here too.
             if rec.get("article_idx", -1) >= total_target:
                 break
 
@@ -644,46 +738,41 @@ def _build_faiss_from_jsonl(
             current_idx += 1
 
             if len(batch_docs) >= batch_size:
-                vector_db = _flush_faiss_batch(
-                    vector_db, batch_docs, embeddings, faiss_path,
-                    save=(batches_since_save + 1 >= save_every_n_batches),
-                )
-                n_indexed += len(batch_docs)
-                save_state(db_dir, current_idx, n_indexed, tag="faiss_")
+                save_now = (batches_since_save + 1 >= save_every_n_batches)
+                _flush_and_check(save_now)
                 print(
                     f"FAISS: {n_indexed} chunks indexed "
                     f"(read up to chunk {current_idx})."
                 )
-                batch_docs = []
                 batches_since_save = (
-                    0 if (batches_since_save + 1 >= save_every_n_batches)
-                    else batches_since_save + 1
+                    0 if save_now else batches_since_save + 1
                 )
 
-                # Periodic verified single-slot backup.
                 if n_indexed - last_backup_at >= backup_every:
-                    if vector_db is not None:
-                        vector_db.save_local(faiss_path)
-                        if _verify_faiss(faiss_path, embeddings):
-                            _refresh_faiss_backup(faiss_path, db_dir)
-                            last_backup_at = n_indexed
+                    vector_db.save_local(faiss_path)
+                    ok, _, reason = _verify_faiss(
+                        faiss_path, expected_n=n_indexed
+                    )
+                    if not ok:
+                        raise RuntimeError(
+                            f"Pre-backup integrity check FAILED: {reason}. "
+                            f"Halting; previous backup preserved."
+                        )
+                    if _refresh_faiss_backup(faiss_path, db_dir, n_indexed):
+                        last_backup_at = n_indexed
 
-    # Flush trailing batch
     if batch_docs:
-        vector_db = _flush_faiss_batch(
-            vector_db, batch_docs, embeddings, faiss_path, save=True
-        )
-        n_indexed += len(batch_docs)
-        save_state(db_dir, current_idx, n_indexed, tag="faiss_")
+        _flush_and_check(save_now=True)
 
     if vector_db is not None:
         vector_db.save_local(faiss_path)
-        if _verify_faiss(faiss_path, embeddings):
-            _refresh_faiss_backup(faiss_path, db_dir)
+        ok, _, reason = _verify_faiss(faiss_path, expected_n=n_indexed)
+        if not ok:
+            raise RuntimeError(f"Final save integrity check FAILED: {reason}.")
+        _refresh_faiss_backup(faiss_path, db_dir, n_indexed)
 
     print(f"\nFAISS done. {n_indexed} chunks indexed at {faiss_path}")
     return n_indexed
-
 
 def _flush_faiss_batch(vector_db, batch_docs, embeddings, faiss_path, save):
     if vector_db is None:

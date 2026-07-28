@@ -9,6 +9,7 @@ backwards compatibility with older indexes.
 """
 
 import bm25s
+import os
 from Stemmer import Stemmer
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -94,17 +95,22 @@ class SimpleHybridRetriever:
             self.vector_db = None
 
         if bm25s_path:
-            self.retriever_bm25 = bm25s.BM25.load(
-                bm25s_path, load_corpus=True, mmap=bm25_mmap
+            shard_dirs = sorted(
+                os.path.join(bm25s_path, d)
+                for d in os.listdir(bm25s_path)
+                if d.startswith("shard_")
             )
-            corpus_n = (
-                len(self.retriever_bm25.corpus)
-                if self.retriever_bm25.corpus is not None
-                else 0
+            self.retrievers_bm25 = [
+                bm25s.BM25.load(d, load_corpus=True, mmap=bm25_mmap)
+                for d in shard_dirs
+            ]
+            total = sum(
+                len(r.corpus) if r.corpus is not None else 0
+                for r in self.retrievers_bm25
             )
-            print(f"BM25 loaded: {corpus_n} items.")
+            print(f"BM25 loaded: {len(self.retrievers_bm25)} shards, {total} items.")
         else:
-            self.retriever_bm25 = None
+            self.retrievers_bm25 = None
 
         self.stemmer = Stemmer("english")
 
@@ -140,21 +146,22 @@ class SimpleHybridRetriever:
                 if key not in doc_map:
                     doc_map[key] = doc
 
-        # --- Sparse (BM25) ---
-        if self.retriever_bm25 is not None:
+        # --- Sparse (BM25, sharded) ---
+        if self.retrievers_bm25 is not None:
             query_tokens = bm25s.tokenize(query, stemmer=self.stemmer)
-            sparse_docs, _sparse_scores = self.retriever_bm25.retrieve(
-                query_tokens, k=fetch_k
-            )
-            # bm25s returns shape (n_queries, k); we have one query.
-            for rank, rec in enumerate(sparse_docs[0]):
+            pooled = []  # (raw_score, record)
+            for r in self.retrievers_bm25:
+                docs, scores = r.retrieve(query_tokens, k=fetch_k)
+                for rec, sc in zip(docs[0], scores[0]):
+                    pooled.append((sc, rec))
+            # Approximate global order across shards by raw score.
+            pooled.sort(key=lambda x: x[0], reverse=True)
+            for rank, (_sc, rec) in enumerate(pooled[:fetch_k]):
                 doc = _doc_record_to_document(rec)
                 key = _content_key(doc)
                 rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (
                     rrf_k + (rank + 1)
                 )
-                # Prefer existing entry (likely from FAISS, may have richer
-                # metadata via langchain docstore).
                 if key not in doc_map:
                     doc_map[key] = doc
 

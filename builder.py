@@ -105,6 +105,37 @@ def _count_corpus_chunks(corpus_path):
                 n += 1
     return n
 
+def _restore_faiss_from_backup(faiss_path, db_dir):
+    """Replace the primary index + progress with the verified backup.
+
+    Returns True if a usable backup was restored, False otherwise. Used
+    when resuming after a crash that may have truncated the primary
+    (e.g. an interrupted save_local over a Drive mount).
+    """
+    backup_dir = os.path.join(db_dir, "faiss_index_backup")
+    backup_progress = os.path.join(backup_dir, "faiss_progress.json")
+    primary_progress = os.path.join(db_dir, "faiss_progress.json")
+
+    if not os.path.exists(os.path.join(backup_dir, "index.faiss")):
+        print("  no backup found; cannot restore. Starting from primary/scratch.")
+        return False
+
+    # Wipe possibly-truncated primary, replace with backup.
+    if os.path.exists(faiss_path):
+        shutil.rmtree(faiss_path)
+    shutil.copytree(backup_dir, faiss_path)
+
+    # Restore the snapshotted progress so index + counter agree.
+    src = backup_progress if os.path.exists(backup_progress) else None
+    if src:
+        shutil.copy2(src, primary_progress)
+        # Remove the nested copy so it isn't mistaken for index data.
+        nested = os.path.join(faiss_path, "faiss_progress.json")
+        if os.path.exists(nested):
+            os.remove(nested)
+    print(f"  restored primary index + progress from backup: {backup_dir}")
+    return True
+
 
 # --- BM25 BUILDER ---
 
@@ -471,7 +502,6 @@ def build_bm25_sharded(corpus_path, bm25_root, shard_chunks=2000000):
     return shard_i
 
 # --- FAISS BUILDER ---
-
 def build_faiss_database(
     db_dir,
     total_target=None,
@@ -488,38 +518,9 @@ def build_faiss_database(
     save_every_n_batches=1,
     reuse_corpus_jsonl=True,
     corpus_filename="corpus.jsonl",
+    backup_every=2_000_000,
+    resume_from_backup=False,
 ):
-    """
-    Build a FAISS dense index over a HuggingFace dataset.
-
-    If a chunk corpus JSONL already exists in db_dir (e.g. from the BM25
-    builder), it is reused so chunking is not redone. Otherwise the corpus
-    is generated alongside indexing.
-
-    Resume semantics match the BM25 builder: state tracks article index
-    when streaming from HF, or chunk index when consuming a JSONL corpus.
-
-    Args:
-        db_dir: Output directory.
-        total_target: Max number of *articles* to process (None = all).
-        batch_size: Items per FAISS add + checkpoint.
-        hf_dataset: Pre-loaded HF dataset, or None for wikimedia/wikipedia.
-        text_field, title_field: Field names in the source dataset.
-        embedding_model: HF model id for embeddings.
-        device: "cpu" or "cuda".
-        chunk_size, chunk_overlap, min_chunk_chars: chunker config (only
-                      used if not reusing an existing JSONL corpus).
-        mount_drive: Whether to mount Drive (Colab).
-        save_every_n_batches: Persist FAISS to disk every N batches. Saving
-                      every batch is safest but slower for large indexes.
-        reuse_corpus_jsonl: If True and corpus_filename exists in db_dir,
-                      embed from it directly (skips re-chunking). Strongly
-                      recommended when BM25 index was built first.
-        corpus_filename: Name of the JSONL corpus.
-
-    Returns:
-        Total number of chunks indexed.
-    """
     _maybe_mount_drive(mount_drive)
 
     faiss_path = os.path.join(db_dir, "faiss_index")
@@ -545,6 +546,8 @@ def build_faiss_database(
             batch_size=batch_size,
             total_target=total_target,
             save_every_n_batches=save_every_n_batches,
+            backup_every=backup_every,
+            resume_from_backup=resume_from_backup,
         )
     else:
         print("No chunk corpus found; streaming + chunking from HF dataset.")
@@ -562,8 +565,9 @@ def build_faiss_database(
             batch_size=batch_size,
             total_target=total_target,
             save_every_n_batches=save_every_n_batches,
+            backup_every=backup_every,
+            resume_from_backup=resume_from_backup,
         )
-
 
 def _load_or_init_faiss(faiss_path, embeddings, initial_docs):
     """Load FAISS if present, else initialise from initial_docs."""
@@ -585,7 +589,11 @@ def _build_faiss_from_jsonl(
     total_target,
     save_every_n_batches,
     backup_every=2_000_000,
+    resume_from_backup=False,
 ):
+    if resume_from_backup:
+        _restore_faiss_from_backup(faiss_path, db_dir)
+
     state = get_state(db_dir, tag="faiss_")
     start_chunk_idx = state.get("last_article_index", 0)  # chunk offset on disk
     n_indexed = state.get("n_chunks_written", 0)
@@ -670,7 +678,6 @@ def _build_faiss_from_jsonl(
 
     if vector_db is not None:
         vector_db.save_local(faiss_path)
-        # Final backup so the last stretch is protected too.
         if _verify_faiss(faiss_path, embeddings):
             _refresh_faiss_backup(faiss_path, db_dir)
 
@@ -704,8 +711,12 @@ def _build_faiss_from_stream(
     total_target,
     save_every_n_batches,
     backup_every=2_000_000,
+    resume_from_backup=False,
 ):
     splitter = _make_splitter(chunk_size, chunk_overlap)
+
+    if resume_from_backup:
+        _restore_faiss_from_backup(faiss_path, db_dir)
 
     state = get_state(db_dir, tag="faiss_")
     current_article_idx = state["last_article_index"]
@@ -808,9 +819,10 @@ def _build_faiss_from_stream(
 
     if vector_db is not None:
         vector_db.save_local(faiss_path)
+        if _verify_faiss(faiss_path, embeddings):
+            _refresh_faiss_backup(faiss_path, db_dir)
     print(f"\nFAISS done. {n_chunks_indexed} chunks indexed at {faiss_path}")
     return n_chunks_indexed
-
 
 # --- CONVENIENCE: build full pipeline ---
 

@@ -364,83 +364,7 @@ def _refresh_faiss_backup(faiss_path, db_dir, expected_n):
     os.rename(backup_tmp, backup_dir)
     print(f"  backup refreshed and verified ({ntotal} vectors) -> {backup_dir}")
     return True
-# def _build_bm25_index_from_corpus(
-#     corpus_path, bm25_path, stemmer, shard_size=2_000_000
-# ):
-#     """Build a BM25 index with sharded tokenisation (bm25s 0.3.10).
 
-#     bm25s.tokenize has no shared-vocab argument, so each shard is
-#     tokenised independently and its local token ids are remapped into a
-#     single global vocab before the id lists are concatenated. Indexes
-#     once at the end (no O(N^2) re-indexing). Output is a single index
-#     dir, load-compatible with the retriever's BM25.load(load_corpus=True).
-#     """
-#     if not os.path.exists(corpus_path):
-#         raise FileNotFoundError(f"Corpus file not found: {corpus_path}")
-
-#     corpus_records = []
-#     with open(corpus_path, "r", encoding="utf-8") as f:
-#         for line in f:
-#             line = line.strip()
-#             if not line:
-#                 continue
-#             corpus_records.append(json.loads(line))
-
-#     if not corpus_records:
-#         raise RuntimeError("Empty corpus; nothing to index.")
-
-#     n = len(corpus_records)
-#     print(f"Tokenising {n} chunks in shards of {shard_size}...")
-
-#     global_vocab = {}          # token string -> global id
-#     all_ids = []               # list of per-doc lists of global ids
-
-#     for start in range(0, n, shard_size):
-#         end = min(start + shard_size, n)
-#         shard_texts = [r["text"] for r in corpus_records[start:end]]
-
-#         tok = bm25s.tokenize(
-#             shard_texts,
-#             stemmer=stemmer,
-#             return_ids=True,
-#             show_progress=False,
-#         )
-#         # tok.vocab: token -> local_id ; tok.ids: list of lists of local ids
-#         local_id_to_token = {v: k for k, v in tok.vocab.items()}
-
-#         # Build a local->global id translation for this shard's vocab.
-#         local_to_global = {}
-#         for token, local_id in tok.vocab.items():
-#             g = global_vocab.get(token)
-#             if g is None:
-#                 g = len(global_vocab)
-#                 global_vocab[token] = g
-#             local_to_global[local_id] = g
-
-#         # Remap this shard's doc-id-lists into global ids.
-#         for doc_ids in tok.ids:
-#             all_ids.append([local_to_global[i] for i in doc_ids])
-
-#         del shard_texts, tok, local_id_to_token, local_to_global
-#         gc.collect()
-#         print(f"  tokenised {end}/{n}  (vocab size {len(global_vocab)})")
-
-#     print("Indexing (single pass)...")
-#     tokens = bm25s.tokenization.Tokenized(ids=all_ids, vocab=global_vocab)
-#     retriever = bm25s.BM25(corpus=corpus_records)
-#     retriever.index(tokens)
-
-#     del all_ids, tokens, global_vocab
-#     gc.collect()
-
-#     if os.path.exists(bm25_path):
-#         shutil.rmtree(bm25_path)
-#     os.makedirs(bm25_path, exist_ok=True)
-#     retriever.save(bm25_path, corpus=corpus_records)
-
-#     del corpus_records, retriever
-#     gc.collect()
-#     return n
 class _TokenizedCorpus:
     """Re-iterable stream of token-string lists, one per corpus line.
 
@@ -538,11 +462,19 @@ def build_bm25_sharded(corpus_path, bm25_root, shard_chunks=2000000):
         if os.path.exists(d):
             shutil.rmtree(d)  # remove any partial/truncated shard
         os.makedirs(d, exist_ok=True)
+
+        # Prepend title so BM25 indexes the entity name into every chunk
+        # (fixes pronoun/alias chunks that never contain the exact title),
+        # and so the explicit subject persists in the returned text.
+        for r in records:
+            title = r.get("title", "")
+            r["text"] = f"Title: {title}, Subject: {title}\n\n{r['text']}"
+
         texts = [r["text"] for r in records]
         tokens = bm25s.tokenize(texts, stemmer=stemmer, show_progress=False)
-        r = bm25s.BM25(corpus=records)
-        r.index(tokens)
-        r.save(d, corpus=records)
+        r_idx = bm25s.BM25(corpus=records)
+        r_idx.index(tokens)
+        r_idx.save(d, corpus=records)
         print(f"  shard {idx} saved: {len(records)} chunks -> {d}")
 
     with open(corpus_path, "r", encoding="utf-8") as f:
@@ -673,10 +605,7 @@ def _build_faiss_from_jsonl(
 
     vector_db = None
     if os.path.exists(os.path.join(faiss_path, "index.faiss")):
-        # FAIL FAST: verify the primary matches the counter before resuming.
-        ok, ntotal, reason = _verify_faiss(
-            faiss_path, expected_n=n_indexed
-        )
+        ok, ntotal, reason = _verify_faiss(faiss_path, expected_n=n_indexed)
         if not ok:
             raise RuntimeError(
                 f"Refusing to resume: primary index failed integrity check "
@@ -701,9 +630,7 @@ def _build_faiss_from_jsonl(
         n_indexed += len(batch_docs)
         save_state(db_dir, current_idx, n_indexed, tag="faiss_")
         if save_now:
-            ok, ntotal, reason = _verify_faiss(
-                faiss_path, expected_n=n_indexed
-            )
+            ok, _, reason = _verify_faiss(faiss_path, expected_n=n_indexed)
             if not ok:
                 raise RuntimeError(
                     f"Save integrity check FAILED after batch: {reason}. "
@@ -722,14 +649,20 @@ def _build_faiss_from_jsonl(
                 continue
 
             rec = json.loads(line)
+
+            # Gate on ARTICLE index, so total_target means articles here too.
             if rec.get("article_idx", -1) >= total_target:
                 break
 
+            title = rec.get("title", "")
+            prefixed = (
+                f"Title: {title}, Subject: {title}\n\n{rec['text']}"
+            )
             batch_docs.append(
                 Document(
-                    page_content=rec["text"],
+                    page_content=prefixed,
                     metadata={
-                        "title": rec.get("title", ""),
+                        "title": title,
                         "article_idx": rec.get("article_idx", -1),
                         "chunk_idx": rec.get("chunk_idx", -1),
                     },
@@ -761,6 +694,7 @@ def _build_faiss_from_jsonl(
                     if _refresh_faiss_backup(faiss_path, db_dir, n_indexed):
                         last_backup_at = n_indexed
 
+    # Flush trailing batch
     if batch_docs:
         _flush_and_check(save_now=True)
 
@@ -782,7 +716,6 @@ def _flush_faiss_batch(vector_db, batch_docs, embeddings, faiss_path, save):
     if save:
         vector_db.save_local(faiss_path)
     return vector_db
-
 
 
 def _build_faiss_from_stream(
@@ -829,6 +762,16 @@ def _build_faiss_from_stream(
 
     vector_db = None
     if os.path.exists(os.path.join(faiss_path, "index.faiss")):
+        ok, ntotal, reason = _verify_faiss(
+            faiss_path, expected_n=n_chunks_indexed
+        )
+        if not ok:
+            raise RuntimeError(
+                f"Refusing to resume: primary index failed integrity check "
+                f"({reason}). On-disk vectors={ntotal}, progress claims "
+                f"{n_chunks_indexed}. Restore a verified backup "
+                f"(resume_from_backup=True) or reset state before rerunning."
+            )
         vector_db = FAISS.load_local(
             faiss_path, embeddings, allow_dangerous_deserialization=True
         )
@@ -852,8 +795,11 @@ def _build_faiss_from_stream(
                 for chunk, title, chunk_i in _iter_chunks(
                     entry, splitter, text_field, title_field, min_chunk_chars
                 ):
+                    prefixed = (
+                        f"Title: {title}, Subject: {title}\n\n{chunk}"
+                    )
                     rec = {
-                        "text": chunk,
+                        "text": prefixed,
                         "title": title,
                         "article_idx": article_idx_for_record,
                         "chunk_idx": chunk_i,
@@ -863,7 +809,7 @@ def _build_faiss_from_stream(
                     )
                     batch_docs.append(
                         Document(
-                            page_content=chunk,
+                            page_content=prefixed,
                             metadata={
                                 "title": title,
                                 "article_idx": article_idx_for_record,
@@ -892,24 +838,44 @@ def _build_faiss_from_stream(
             save_state(
                 db_dir, current_article_idx, n_chunks_indexed, tag="faiss_"
             )
+
+            if batch_docs and save_now:
+                ok, _, reason = _verify_faiss(
+                    faiss_path, expected_n=n_chunks_indexed
+                )
+                if not ok:
+                    raise RuntimeError(
+                        f"Save integrity check FAILED after batch: {reason}. "
+                        f"Halting so the corrupt state is not extended."
+                    )
+
             print(
                 f"FAISS: articles {current_article_idx} | "
                 f"chunks indexed {n_chunks_indexed} "
                 f"(+{len(batch_docs)} this batch)"
             )
 
-            # Periodic verified single-slot backup.
             if n_chunks_indexed - last_backup_at >= backup_every:
-                if vector_db is not None:
-                    vector_db.save_local(faiss_path)
-                    if _verify_faiss(faiss_path, embeddings):
-                        _refresh_faiss_backup(faiss_path, db_dir)
-                        last_backup_at = n_chunks_indexed
+                vector_db.save_local(faiss_path)
+                ok, _, reason = _verify_faiss(
+                    faiss_path, expected_n=n_chunks_indexed
+                )
+                if not ok:
+                    raise RuntimeError(
+                        f"Pre-backup integrity check FAILED: {reason}. "
+                        f"Halting; previous backup preserved."
+                    )
+                if _refresh_faiss_backup(
+                    faiss_path, db_dir, n_chunks_indexed
+                ):
+                    last_backup_at = n_chunks_indexed
 
     if vector_db is not None:
         vector_db.save_local(faiss_path)
-        if _verify_faiss(faiss_path, embeddings):
-            _refresh_faiss_backup(faiss_path, db_dir)
+        ok, _, reason = _verify_faiss(faiss_path, expected_n=n_chunks_indexed)
+        if not ok:
+            raise RuntimeError(f"Final save integrity check FAILED: {reason}.")
+        _refresh_faiss_backup(faiss_path, db_dir, n_chunks_indexed)
     print(f"\nFAISS done. {n_chunks_indexed} chunks indexed at {faiss_path}")
     return n_chunks_indexed
 

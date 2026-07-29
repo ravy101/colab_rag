@@ -656,10 +656,18 @@ def _build_faiss_from_jsonl(
         n_indexed += len(batch_docs)
         save_state(db_dir, current_idx, n_indexed, tag="faiss_")
         if save_now:
-            ok, _, reason = _verify_faiss(faiss_path, expected_n=n_indexed)
+            ok, _, reason = (False, 0, "not attempted")
+            for i in range(5):                    # settle-and-retry for Drive
+                ok, _, reason = _verify_faiss(faiss_path, expected_n=n_indexed)
+                if ok:
+                    break
+                if i < 4:
+                    print(f"  post-save verify attempt {i+1}/5 failed "
+                        f"({reason}); waiting 8s for Drive to flush...")
+                    time.sleep(8)
             if not ok:
                 raise RuntimeError(
-                    f"Save integrity check FAILED after batch: {reason}. "
+                    f"Save integrity check FAILED after {5} attempts: {reason}. "
                     f"Halting so the corrupt state is not extended. "
                     f"Last good backup is untouched."
                 )

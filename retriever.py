@@ -82,17 +82,46 @@ class SimpleHybridRetriever:
         )
 
         if faiss_path:
-            self.vector_db = FAISS.load_local(
-                faiss_path,
-                self.embeddings,
-                allow_dangerous_deserialization=True,
+            # Detect sharded layout: a faiss_root containing shard_XXXX/ dirs,
+            # each with its own index.faiss (as written by build_faiss_sharded).
+            faiss_shard_dirs = sorted(
+                os.path.join(faiss_path, d)
+                for d in os.listdir(faiss_path)
+                if d.startswith("shard_")
+                and os.path.exists(os.path.join(faiss_path, d, "index.faiss"))
             )
-            print(
-                f"FAISS loaded: "
-                f"{len(self.vector_db.index_to_docstore_id)} items."
-            )
+
+            if faiss_shard_dirs:
+                self.vector_dbs = [
+                    FAISS.load_local(
+                        d,
+                        self.embeddings,
+                        allow_dangerous_deserialization=True,
+                    )
+                    for d in faiss_shard_dirs
+                ]
+                total = sum(
+                    len(v.index_to_docstore_id) for v in self.vector_dbs
+                )
+                print(
+                    f"FAISS loaded: {len(self.vector_dbs)} shards, "
+                    f"{total} items."
+                )
+            else:
+                # Backward-compat: a single monolithic FAISS index directory.
+                self.vector_dbs = [
+                    FAISS.load_local(
+                        faiss_path,
+                        self.embeddings,
+                        allow_dangerous_deserialization=True,
+                    )
+                ]
+                print(
+                    f"FAISS loaded: 1 index, "
+                    f"{len(self.vector_dbs[0].index_to_docstore_id)} items."
+                )
         else:
-            self.vector_db = None
+            self.vector_dbs = None
 
         if bm25s_path:
             shard_dirs = sorted(
@@ -133,12 +162,16 @@ class SimpleHybridRetriever:
         rrf_scores = {}
         doc_map = {}
 
-        # --- Dense (FAISS) ---
-        if self.vector_db is not None:
-            dense_results = self.vector_db.similarity_search_with_score(
-                query, k=fetch_k
-            )
-            for rank, (doc, _faiss_score) in enumerate(dense_results):
+        # --- Dense (FAISS, sharded) ---
+        if self.vector_dbs is not None:
+            pooled = []  # (distance, doc)  -- lower distance = better
+            for v in self.vector_dbs:
+                results = v.similarity_search_with_score(query, k=fetch_k)
+                for doc, dist in results:
+                    pooled.append((dist, doc))
+            # Global order across shards: ascending distance (best first).
+            pooled.sort(key=lambda x: x[0])
+            for rank, (_dist, doc) in enumerate(pooled[:fetch_k]):
                 key = _content_key(doc)
                 rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (
                     rrf_k + (rank + 1)

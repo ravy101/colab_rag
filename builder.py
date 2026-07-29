@@ -603,6 +603,111 @@ def _load_or_init_faiss(faiss_path, embeddings, initial_docs):
         return None
     return FAISS.from_documents(initial_docs, embeddings)
 
+def build_faiss_sharded(
+    corpus_path,
+    faiss_root,
+    embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+    device="cuda",
+    shard_chunks=1_000_000,   # ~1.5 GB per index.faiss, safely under the wall
+    batch_size=5000,
+):
+    """Build FAISS as independent, resumable, verified shards over an
+    existing corpus. Each shard's index.faiss stays small enough to write
+    reliably over the Drive mount. Completed shards are skipped on rerun.
+    """
+    import os, json, shutil, faiss, pickle, time
+    from langchain_community.vectorstores import FAISS
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_core.documents import Document
+
+    os.makedirs(faiss_root, exist_ok=True)
+    embeddings = HuggingFaceEmbeddings(
+        model_name=embedding_model,
+        model_kwargs={"device": device},
+        encode_kwargs={"device": device},
+    )
+
+    def shard_dir(i):
+        return os.path.join(faiss_root, f"shard_{i:04d}")
+
+    def _verify_shard(d, expected_n):
+        try:
+            idx = faiss.read_index(os.path.join(d, "index.faiss"))
+        except Exception:
+            return False
+        return idx.ntotal == expected_n
+
+    def _done(i):
+        d = shard_dir(i)
+        idxf = os.path.join(d, "index.faiss")
+        return os.path.exists(idxf) and os.path.getsize(idxf) > 1024
+
+    def flush(idx, records):
+        d = shard_dir(idx)
+        if _done(idx):
+            print(f"  shard {idx} already complete, skipping")
+            return
+        if os.path.exists(d):
+            shutil.rmtree(d)   # drop any partial/truncated shard
+        os.makedirs(d, exist_ok=True)
+
+        vdb = None
+        for start in range(0, len(records), batch_size):
+            docs = []
+            for r in records[start:start + batch_size]:
+                title = r.get("title", "")
+                docs.append(Document(
+                    page_content=f"Title: {title}, Subject: {title}\n\n{r['text']}",
+                    metadata={
+                        "title": title,
+                        "article_idx": r.get("article_idx", -1),
+                        "chunk_idx": r.get("chunk_idx", -1),
+                    },
+                ))
+            if vdb is None:
+                vdb = FAISS.from_documents(docs, embeddings)
+            else:
+                vdb.add_documents(docs)
+
+        vdb.save_local(d)
+        # verify with a couple of retries for the Drive flush race
+        ok = False
+        for a in range(4):
+            if _verify_shard(d, len(records)):
+                ok = True
+                break
+            time.sleep(8)
+        if not ok:
+            raise RuntimeError(
+                f"shard {idx} failed verify after save "
+                f"(expected {len(records)} vectors). Halting; "
+                f"completed shards are intact."
+            )
+        print(f"  shard {idx} saved & verified: {len(records)} chunks -> {d}")
+
+    shard_i = 0
+    buf = []
+    with open(corpus_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            buf.append(json.loads(line))
+            if len(buf) >= shard_chunks:
+                if not _done(shard_i):
+                    flush(shard_i, buf)
+                else:
+                    print(f"  shard {shard_i} already complete, skipping")
+                buf = []
+                shard_i += 1
+
+    if buf:
+        if not _done(shard_i):
+            flush(shard_i, buf)
+        shard_i += 1
+
+    print(f"Done. {shard_i} FAISS shards at {faiss_root}")
+    return shard_i
 
 def _build_faiss_from_jsonl(
     corpus_path,

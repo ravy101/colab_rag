@@ -1,13 +1,11 @@
 import bm25s
 import os
+import json
 import pickle
-from collections import OrderedDict
 
 import faiss
 import numpy as np
 from Stemmer import Stemmer
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 
 try:
@@ -40,71 +38,89 @@ def _content_key(doc_or_rec):
     return ("txt", str(doc_or_rec))
 
 
-class _LazyFaissShardStore:
+class _LeanFaissStore:
     """
-    Lazily searches FAISS shards one at a time to keep RAM bounded.
+    Sharded FAISS with text kept OUT of RAM.
 
-    Nothing is loaded at construction. For each query, a shard's mmapped
-    index and its docstore pickle are opened, searched, matched hits are
-    materialised as Documents, then the shard is released. An optional
-    small LRU cache keeps the most-recently-used shards resident so
-    repeated queries don't re-read the same pickle every time.
-
-    Set cache_size to the number of shards you can afford in RAM at once.
-    cache_size=1 gives the smallest footprint (one shard's docstore).
+    Per shard we hold only locators.pkl (vector_id -> (article_idx,
+    chunk_idx, title)); vectors are mmapped via faiss.read_index; chunk
+    text is seeked from corpus.jsonl on demand using corpus_offsets.pkl.
+    No langchain docstore is ever unpickled.
     """
 
-    def __init__(self, shard_dirs, mmap=True, cache_size=1):
-        self.shard_dirs = shard_dirs
+    def __init__(self, faiss_root, corpus_path, mmap=True):
+        self.faiss_root = faiss_root
+        self.corpus_path = corpus_path
         self.mmap = mmap
-        self.cache_size = max(1, cache_size)
-        self._cache = OrderedDict()  # dir -> (index, docstore, id_map)
 
-        # Cheap up-front pass: read ntotal only, then release, so we can
-        # report totals without holding anything resident.
+        with open(
+            os.path.join(faiss_root, "corpus_offsets.pkl"), "rb"
+        ) as f:
+            self.offsets = pickle.load(f)
+
+        self.shard_dirs = sorted(
+            os.path.join(faiss_root, d)
+            for d in os.listdir(faiss_root)
+            if d.startswith("shard_")
+            and os.path.exists(os.path.join(faiss_root, d, "index.faiss"))
+        )
+        if not self.shard_dirs:
+            raise FileNotFoundError(f"No shards under {faiss_root}")
+
+        self.indexes = []     # mmapped faiss indexes (small resident cost)
+        self.locators = []    # per-shard vector_id -> (aidx, cidx, title)
         total = 0
-        for d in shard_dirs:
-            idx = self._read_index(d)
+        for d in self.shard_dirs:
+            flags = faiss.IO_FLAG_MMAP if mmap else 0
+            idx = faiss.read_index(os.path.join(d, "index.faiss"), flags)
+            with open(os.path.join(d, "locators.pkl"), "rb") as f:
+                loc = pickle.load(f)
+            self.indexes.append(idx)
+            self.locators.append(loc)
             total += idx.ntotal
-            del idx
-        self.total = total
+        self._corpus_f = open(corpus_path, "rb")
+        print(
+            f"FAISS lean store: {len(self.shard_dirs)} shards, "
+            f"{total} items, text streamed from corpus."
+        )
 
-    def _read_index(self, d):
-        flags = faiss.IO_FLAG_MMAP if self.mmap else 0
-        return faiss.read_index(os.path.join(d, "index.faiss"), flags)
-
-    def _load_shard(self, d):
-        if d in self._cache:
-            self._cache.move_to_end(d)
-            return self._cache[d]
-        index = self._read_index(d)
-        with open(os.path.join(d, "index.pkl"), "rb") as f:
-            docstore, id_map = pickle.load(f)
-        self._cache[d] = (index, docstore, id_map)
-        self._cache.move_to_end(d)
-        while len(self._cache) > self.cache_size:
-            self._cache.popitem(last=False)  # evict least-recently-used
-        return self._cache[d]
+    def _fetch_text(self, article_idx, chunk_idx):
+        pos = self.offsets.get((article_idx, chunk_idx))
+        if pos is None:
+            return ""
+        self._corpus_f.seek(pos)
+        line = self._corpus_f.readline()
+        try:
+            return json.loads(line)["text"]
+        except Exception:
+            return ""
 
     def search_all(self, query_vec, k):
-        """Pool (Document, distance) hits across every shard."""
+        """Return pooled list of (Document, distance) across all shards."""
         q = np.asarray(query_vec, dtype=np.float32).reshape(1, -1)
         pooled = []
-        for d in self.shard_dirs:
-            index, docstore, id_map = self._load_shard(d)
-            kk = min(k, index.ntotal) if index.ntotal else 0
+        for idx, loc in zip(self.indexes, self.locators):
+            kk = min(k, idx.ntotal) if idx.ntotal else 0
             if kk == 0:
                 continue
-            distances, ids = index.search(q, kk)
+            distances, ids = idx.search(q, kk)
             for dist, vid in zip(distances[0], ids[0]):
                 if vid == -1:
                     continue
-                doc_id = id_map.get(int(vid))
-                if doc_id is None:
+                entry = loc.get(int(vid))
+                if entry is None:
                     continue
-                doc = docstore.search(doc_id)
-                if isinstance(doc, Document):
-                    pooled.append((doc, float(dist)))
+                aidx, cidx, title = entry
+                text = self._fetch_text(aidx, cidx)
+                doc = Document(
+                    page_content=text,
+                    metadata={
+                        "title": title,
+                        "article_idx": aidx,
+                        "chunk_idx": cidx,
+                    },
+                )
+                pooled.append((doc, float(dist)))
         return pooled
 
 
@@ -112,10 +128,9 @@ class SimpleHybridRetriever:
     """
     BM25 + FAISS retriever with Reciprocal Rank Fusion.
 
-    faiss_mmap=True memory-maps each shard's vectors AND loads shards
-    lazily one at a time, so neither the full vector set nor all
-    docstores are resident at once. Use faiss_cache_size to trade RAM
-    for speed (number of shards kept warm; default 1 = smallest RAM).
+    FAISS uses a lean store: vectors mmapped, text streamed from
+    corpus.jsonl, docstore never loaded. Requires the migration script
+    (corpus_offsets.pkl + per-shard locators.pkl) to have been run.
     """
 
     def __init__(
@@ -123,67 +138,31 @@ class SimpleHybridRetriever:
         embedding_model,
         faiss_path=None,
         bm25s_path=None,
+        corpus_path=None,
         device="cpu",
         mount_drive=True,
         bm25_mmap=False,
-        faiss_mmap=False,
-        faiss_cache_size=1,
+        faiss_mmap=True,
     ):
         if mount_drive and _IN_COLAB:
             drive.mount("/content/drive")
 
+        from langchain_huggingface import HuggingFaceEmbeddings
         self.embeddings = HuggingFaceEmbeddings(
             model_name=embedding_model,
             model_kwargs={"device": device},
             encode_kwargs={"device": device},
         )
 
-        self.faiss_mmap = faiss_mmap
-        self.vector_dbs = None       # eager langchain FAISS list
-        self.faiss_store = None      # lazy shard store
-
+        self.faiss_store = None
         if faiss_path:
-            shard_dirs = sorted(
-                os.path.join(faiss_path, d)
-                for d in os.listdir(faiss_path)
-                if d.startswith("shard_")
-                and os.path.exists(
-                    os.path.join(faiss_path, d, "index.faiss")
+            if corpus_path is None:
+                raise ValueError(
+                    "corpus_path is required for the lean FAISS store."
                 )
+            self.faiss_store = _LeanFaissStore(
+                faiss_path, corpus_path, mmap=faiss_mmap
             )
-            if not shard_dirs and os.path.exists(
-                os.path.join(faiss_path, "index.faiss")
-            ):
-                shard_dirs = [faiss_path]
-            if not shard_dirs:
-                raise FileNotFoundError(
-                    f"No FAISS index found under {faiss_path}."
-                )
-
-            if faiss_mmap:
-                self.faiss_store = _LazyFaissShardStore(
-                    shard_dirs, mmap=True, cache_size=faiss_cache_size
-                )
-                print(
-                    f"FAISS ready (lazy mmap): {len(shard_dirs)} shard(s), "
-                    f"{self.faiss_store.total} items, "
-                    f"cache_size={faiss_cache_size}."
-                )
-            else:
-                self.vector_dbs = [
-                    FAISS.load_local(
-                        d, self.embeddings,
-                        allow_dangerous_deserialization=True,
-                    )
-                    for d in shard_dirs
-                ]
-                total = sum(
-                    len(v.index_to_docstore_id) for v in self.vector_dbs
-                )
-                print(
-                    f"FAISS loaded: {len(self.vector_dbs)} shard(s), "
-                    f"{total} items."
-                )
 
         if bm25s_path:
             shard_dirs = sorted(
@@ -213,20 +192,11 @@ class SimpleHybridRetriever:
         rrf_scores = {}
         doc_map = {}
 
-        # --- Dense (FAISS) ---  distances: lower is better -> sort ascending
-        dense_pooled = []
+        # --- Dense (FAISS) --- distances lower is better -> sort ascending
         if self.faiss_store is not None:
             query_vec = self.embeddings.embed_query(query)
             dense_pooled = self.faiss_store.search_all(query_vec, fetch_k)
-        elif self.vector_dbs is not None:
-            for v in self.vector_dbs:
-                for doc, dist in v.similarity_search_with_score(
-                    query, k=fetch_k
-                ):
-                    dense_pooled.append((doc, dist))
-
-        if dense_pooled:
-            dense_pooled.sort(key=lambda x: x[1])  # ascending distance
+            dense_pooled.sort(key=lambda x: x[1])
             for rank, (doc, _dist) in enumerate(dense_pooled[:fetch_k]):
                 key = _content_key(doc)
                 rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (
@@ -235,7 +205,7 @@ class SimpleHybridRetriever:
                 if key not in doc_map:
                     doc_map[key] = doc
 
-        # --- Sparse (BM25, sharded) ---  scores: higher is better
+        # --- Sparse (BM25, sharded) --- scores higher is better
         if self.retrievers_bm25 is not None:
             query_tokens = bm25s.tokenize(query, stemmer=self.stemmer)
             pooled = []

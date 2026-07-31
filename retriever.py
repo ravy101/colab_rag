@@ -2,14 +2,21 @@
 Hybrid retriever for the multiaxial cascade retrieval axis.
 
 Combines BM25 (sparse) and FAISS (dense) retrieval via Reciprocal Rank
-Fusion. Designed to consume indexes built by retrieval_builder.py, which
-stores the BM25 corpus as a list of dicts with `text`, `title`, and
-chunk-locator fields. Falls back gracefully to plain-string corpora for
-backwards compatibility with older indexes.
+Fusion. Designed to consume indexes built by retrieval_builder.py.
+
+Supports both sharded FAISS (a root containing shard_XXXX/ dirs, as written
+by build_faiss_sharded) and a single monolithic FAISS index directory.
+When faiss_mmap=True, each shard's vectors are memory-mapped via
+faiss.read_index(IO_FLAG_MMAP) and queried lazily one shard at a time,
+so the full float32 vector set is never resident at once.
 """
 
 import bm25s
 import os
+import pickle
+
+import faiss
+import numpy as np
 from Stemmer import Stemmer
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -30,14 +37,12 @@ def _doc_record_to_document(rec):
         text = rec.get("text", "")
         meta = {k: v for k, v in rec.items() if k != "text"}
         return Document(page_content=text, metadata=meta)
-    # Fallback: stringify
     return Document(page_content=str(rec), metadata={})
 
 
 def _content_key(doc_or_rec):
     """Stable key for deduplication across BM25 and FAISS results."""
     if isinstance(doc_or_rec, Document):
-        # Prefer (article_idx, chunk_idx) when available; fall back to text.
         meta = doc_or_rec.metadata or {}
         if "article_idx" in meta and "chunk_idx" in meta:
             return ("idx", meta["article_idx"], meta["chunk_idx"])
@@ -49,6 +54,54 @@ def _content_key(doc_or_rec):
     return ("txt", str(doc_or_rec))
 
 
+class _MmapFaissShard:
+    """
+    A single FAISS shard whose vectors are memory-mapped, not loaded.
+
+    Opens index.faiss with IO_FLAG_MMAP so the float32 vectors stay on
+    disk and are paged in on demand. The docstore (index.pkl) is read
+    only to resolve matched ids -> Documents; we do not hold a langchain
+    FAISS wrapper (which would keep the whole docstore resident via its
+    in-memory dict). page_content/metadata are pulled per-hit.
+    """
+
+    def __init__(self, shard_dir):
+        self.shard_dir = shard_dir
+        self.index = faiss.read_index(
+            os.path.join(shard_dir, "index.faiss"),
+            faiss.IO_FLAG_MMAP,
+        )
+        # langchain saves (docstore, index_to_docstore_id) as a tuple.
+        with open(os.path.join(shard_dir, "index.pkl"), "rb") as f:
+            docstore, index_to_docstore_id = pickle.load(f)
+        self._docstore = docstore
+        self._index_to_id = index_to_docstore_id
+
+    @property
+    def ntotal(self):
+        return self.index.ntotal
+
+    def search(self, query_vec, k):
+        """Return list of (Document, distance) for the top-k in this shard."""
+        # query_vec: shape (dim,) float32
+        q = np.asarray(query_vec, dtype=np.float32).reshape(1, -1)
+        k = min(k, self.index.ntotal) if self.index.ntotal else 0
+        if k == 0:
+            return []
+        distances, ids = self.index.search(q, k)
+        out = []
+        for dist, vid in zip(distances[0], ids[0]):
+            if vid == -1:
+                continue
+            doc_id = self._index_to_id.get(int(vid))
+            if doc_id is None:
+                continue
+            doc = self._docstore.search(doc_id)
+            if isinstance(doc, Document):
+                out.append((doc, float(dist)))
+        return out
+
+
 class SimpleHybridRetriever:
     """
     BM25 + FAISS retriever with Reciprocal Rank Fusion.
@@ -56,10 +109,14 @@ class SimpleHybridRetriever:
     Args:
         embedding_model: HF model id for the FAISS embedder. Must match the
                          model used to build the FAISS index.
-        faiss_path: Directory containing FAISS index. None to disable dense.
+        faiss_path: Directory containing FAISS index (monolithic dir, or a
+                    root of shard_XXXX/ dirs). None to disable dense.
         bm25s_path: Directory containing BM25 index. None to disable sparse.
         device: "cpu" or "cuda" for the embedding model.
         mount_drive: Mount Google Drive (Colab only).
+        bm25_mmap: Memory-map BM25 shards.
+        faiss_mmap: Memory-map FAISS shard vectors and query lazily
+                    (keeps the full vector set off the heap).
     """
 
     def __init__(
@@ -69,8 +126,8 @@ class SimpleHybridRetriever:
         bm25s_path=None,
         device="cpu",
         mount_drive=True,
-        bm25_mmap = False,
-        faiss_mmap = False,
+        bm25_mmap=False,
+        faiss_mmap=False,
     ):
         if mount_drive and _IN_COLAB:
             drive.mount("/content/drive")
@@ -81,47 +138,56 @@ class SimpleHybridRetriever:
             encode_kwargs={"device": device},
         )
 
+        self.faiss_mmap = faiss_mmap
+        self.vector_dbs = None      # list of langchain FAISS (non-mmap path)
+        self.faiss_shards = None    # list of _MmapFaissShard (mmap path)
+
         if faiss_path:
-            # Detect sharded layout: a faiss_root containing shard_XXXX/ dirs,
-            # each with its own index.faiss (as written by build_faiss_sharded).
-            faiss_shard_dirs = sorted(
+            shard_dirs = sorted(
                 os.path.join(faiss_path, d)
                 for d in os.listdir(faiss_path)
                 if d.startswith("shard_")
-                and os.path.exists(os.path.join(faiss_path, d, "index.faiss"))
+                and os.path.exists(
+                    os.path.join(faiss_path, d, "index.faiss")
+                )
             )
+            # Monolithic fallback: treat the path itself as one "shard".
+            if not shard_dirs and os.path.exists(
+                os.path.join(faiss_path, "index.faiss")
+            ):
+                shard_dirs = [faiss_path]
 
-            if faiss_shard_dirs:
+            if not shard_dirs:
+                raise FileNotFoundError(
+                    f"No FAISS index found under {faiss_path} "
+                    f"(no shard_XXXX/index.faiss and no index.faiss)."
+                )
+
+            if faiss_mmap:
+                self.faiss_shards = [
+                    _MmapFaissShard(d) for d in shard_dirs
+                ]
+                total = sum(s.ntotal for s in self.faiss_shards)
+                print(
+                    f"FAISS loaded (mmap): {len(self.faiss_shards)} "
+                    f"shard(s), {total} items."
+                )
+            else:
                 self.vector_dbs = [
                     FAISS.load_local(
                         d,
                         self.embeddings,
                         allow_dangerous_deserialization=True,
                     )
-                    for d in faiss_shard_dirs
+                    for d in shard_dirs
                 ]
                 total = sum(
                     len(v.index_to_docstore_id) for v in self.vector_dbs
                 )
                 print(
-                    f"FAISS loaded: {len(self.vector_dbs)} shards, "
-                    f"{total} items."
+                    f"FAISS loaded: {len(self.vector_dbs)} "
+                    f"shard(s), {total} items."
                 )
-            else:
-                # Backward-compat: a single monolithic FAISS index directory.
-                self.vector_dbs = [
-                    FAISS.load_local(
-                        faiss_path,
-                        self.embeddings,
-                        allow_dangerous_deserialization=True,
-                    )
-                ]
-                print(
-                    f"FAISS loaded: 1 index, "
-                    f"{len(self.vector_dbs[0].index_to_docstore_id)} items."
-                )
-        else:
-            self.vector_dbs = None
 
         if bm25s_path:
             shard_dirs = sorted(
@@ -137,7 +203,10 @@ class SimpleHybridRetriever:
                 len(r.corpus) if r.corpus is not None else 0
                 for r in self.retrievers_bm25
             )
-            print(f"BM25 loaded: {len(self.retrievers_bm25)} shards, {total} items.")
+            print(
+                f"BM25 loaded: {len(self.retrievers_bm25)} shards, "
+                f"{total} items."
+            )
         else:
             self.retrievers_bm25 = None
 
@@ -147,14 +216,6 @@ class SimpleHybridRetriever:
         """
         Hybrid search via Reciprocal Rank Fusion.
 
-        Args:
-            query: Query string.
-            k: Number of fused results to return.
-            rrf_k: RRF damping constant (60 is the standard default).
-            fetch_multiplier: Per-retriever fetch depth as a multiple of k.
-                              k * fetch_multiplier candidates are pulled
-                              from each retriever before fusion.
-
         Returns:
             List of dicts: {"doc": Document, "score": float}
         """
@@ -163,15 +224,25 @@ class SimpleHybridRetriever:
         doc_map = {}
 
         # --- Dense (FAISS, sharded) ---
-        if self.vector_dbs is not None:
-            pooled = []  # (distance, doc)  -- lower distance = better
+        # Distances are "lower is better", so pool across shards and sort
+        # ASCENDING before assigning a single global rank for RRF.
+        dense_pooled = []  # (distance, doc)
+
+        if self.faiss_shards is not None:
+            # mmap path: embed once, query each shard, release as we go.
+            query_vec = self.embeddings.embed_query(query)
+            for shard in self.faiss_shards:
+                for doc, dist in shard.search(query_vec, fetch_k):
+                    dense_pooled.append((dist, doc))
+        elif self.vector_dbs is not None:
             for v in self.vector_dbs:
                 results = v.similarity_search_with_score(query, k=fetch_k)
                 for doc, dist in results:
-                    pooled.append((dist, doc))
-            # Global order across shards: ascending distance (best first).
-            pooled.sort(key=lambda x: x[0])
-            for rank, (_dist, doc) in enumerate(pooled[:fetch_k]):
+                    dense_pooled.append((dist, doc))
+
+        if dense_pooled:
+            dense_pooled.sort(key=lambda x: x[0])  # ascending distance
+            for rank, (_dist, doc) in enumerate(dense_pooled[:fetch_k]):
                 key = _content_key(doc)
                 rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (
                     rrf_k + (rank + 1)
@@ -187,7 +258,7 @@ class SimpleHybridRetriever:
                 docs, scores = r.retrieve(query_tokens, k=fetch_k)
                 for rec, sc in zip(docs[0], scores[0]):
                     pooled.append((sc, rec))
-            # Approximate global order across shards by raw score.
+            # BM25 scores are "higher is better" -> sort DESCENDING.
             pooled.sort(key=lambda x: x[0], reverse=True)
             for rank, (_sc, rec) in enumerate(pooled[:fetch_k]):
                 doc = _doc_record_to_document(rec)
@@ -198,7 +269,6 @@ class SimpleHybridRetriever:
                 if key not in doc_map:
                     doc_map[key] = doc
 
-        # Sort and return top-k
         sorted_keys = sorted(
             rrf_scores.items(), key=lambda x: x[1], reverse=True
         )
@@ -206,7 +276,6 @@ class SimpleHybridRetriever:
             {"doc": doc_map[key], "score": score}
             for key, score in sorted_keys[:k]
         ]
-
 
     def mcqa_hybrid_retrieve(self, question, choices, k=5, k_per_choice=3):
         """
@@ -217,23 +286,25 @@ class SimpleHybridRetriever:
         for choice in choices:
             query = f"{question} {choice}"
             for r in self.hybrid_retrieve(query, k=k_per_choice):
-                meta = r['doc'].metadata
-                key = (meta.get('article_idx', -1), meta.get('chunk_idx', -1))
+                meta = r["doc"].metadata
+                key = (meta.get("article_idx", -1), meta.get("chunk_idx", -1))
                 if key == (-1, -1):
-                    key = ('txt', r['doc'].page_content[:200])
-                if key not in all_results or r['score'] > all_results[key]['score']:
+                    key = ("txt", r["doc"].page_content[:200])
+                if key not in all_results or r["score"] > all_results[key]["score"]:
                     all_results[key] = r
-        return sorted(all_results.values(),
-                    key=lambda x: x['score'],
-                    reverse=True)[:k]
+        return sorted(
+            all_results.values(),
+            key=lambda x: x["score"],
+            reverse=True,
+        )[:k]
+
 
 def consolidate_context(retrieval_results, threshold=0.015):
     """
     Format retrieval results into a single context string for the LLM.
 
     Filters out results below an RRF score threshold. The default threshold
-    of 0.015 corresponds to roughly the 60th rank under standard RRF (k=60),
-    i.e. results that appeared only once at low rank in either retriever.
+    of 0.015 corresponds to roughly the 60th rank under standard RRF (k=60).
     """
     context_blocks = []
     for i, entry in enumerate(retrieval_results):
@@ -260,3 +331,5 @@ def consolidate_context(retrieval_results, threshold=0.015):
         "If you use the word 'source' or 'context' I will punish you.\n"
     )
     return prefix + "\n\n".join(context_blocks)
+
+

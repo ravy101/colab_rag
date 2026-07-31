@@ -4,6 +4,7 @@ import json
 import pickle
 
 import faiss
+import time
 import numpy as np
 from Stemmer import Stemmer
 from langchain_core.documents import Document
@@ -39,24 +40,19 @@ def _content_key(doc_or_rec):
 
 
 class _LeanFaissStore:
-    """
-    Sharded FAISS with text kept OUT of RAM.
-
-    Per shard we hold only locators.pkl (vector_id -> (article_idx,
-    chunk_idx, title)); vectors are mmapped via faiss.read_index; chunk
-    text is seeked from corpus.jsonl on demand using corpus_offsets.pkl.
-    No langchain docstore is ever unpickled.
-    """
-
     def __init__(self, faiss_root, corpus_path, mmap=True):
         self.faiss_root = faiss_root
         self.corpus_path = corpus_path
         self.mmap = mmap
 
-        with open(
-            os.path.join(faiss_root, "corpus_offsets.pkl"), "rb"
-        ) as f:
+        t0 = time.time()
+        off_path = os.path.join(faiss_root, "corpus_offsets.pkl")
+        sz = os.path.getsize(off_path) / 1e6
+        print(f"[faiss] loading offset index ({sz:,.1f} MB) ...", flush=True)
+        with open(off_path, "rb") as f:
             self.offsets = pickle.load(f)
+        print(f"[faiss] offsets: {len(self.offsets):,} entries in "
+              f"{time.time()-t0:,.1f}s", flush=True)
 
         self.shard_dirs = sorted(
             os.path.join(faiss_root, d)
@@ -66,23 +62,31 @@ class _LeanFaissStore:
         )
         if not self.shard_dirs:
             raise FileNotFoundError(f"No shards under {faiss_root}")
+        print(f"[faiss] {len(self.shard_dirs)} shards found", flush=True)
 
-        self.indexes = []     # mmapped faiss indexes (small resident cost)
-        self.locators = []    # per-shard vector_id -> (aidx, cidx, title)
+        self.indexes = []
+        self.locators = []
         total = 0
-        for d in self.shard_dirs:
+        for i, d in enumerate(self.shard_dirs, 1):
+            ts = time.time()
             flags = faiss.IO_FLAG_MMAP if mmap else 0
             idx = faiss.read_index(os.path.join(d, "index.faiss"), flags)
+            t_idx = time.time() - ts
+            tl = time.time()
             with open(os.path.join(d, "locators.pkl"), "rb") as f:
                 loc = pickle.load(f)
+            t_loc = time.time() - tl
             self.indexes.append(idx)
             self.locators.append(loc)
             total += idx.ntotal
+            print(f"[faiss]   shard {i}/{len(self.shard_dirs)} "
+                  f"{os.path.basename(d)}: {idx.ntotal:,} vecs "
+                  f"(index {t_idx:,.1f}s, locators {t_loc:,.1f}s)",
+                  flush=True)
+
         self._corpus_f = open(corpus_path, "rb")
-        print(
-            f"FAISS lean store: {len(self.shard_dirs)} shards, "
-            f"{total} items, text streamed from corpus."
-        )
+        print(f"[faiss] READY: {len(self.shard_dirs)} shards, "
+              f"{total:,} items.", flush=True)
 
     def _fetch_text(self, article_idx, chunk_idx):
         pos = self.offsets.get((article_idx, chunk_idx))
@@ -95,14 +99,14 @@ class _LeanFaissStore:
         except Exception:
             return ""
 
-    def search_all(self, query_vec, k):
-        """Return pooled list of (Document, distance) across all shards."""
+    def search_all(self, query_vec, k, verbose=False):
         q = np.asarray(query_vec, dtype=np.float32).reshape(1, -1)
         pooled = []
-        for idx, loc in zip(self.indexes, self.locators):
+        for i, (idx, loc) in enumerate(zip(self.indexes, self.locators), 1):
             kk = min(k, idx.ntotal) if idx.ntotal else 0
             if kk == 0:
                 continue
+            ts = time.time()
             distances, ids = idx.search(q, kk)
             for dist, vid in zip(distances[0], ids[0]):
                 if vid == -1:
@@ -112,15 +116,14 @@ class _LeanFaissStore:
                     continue
                 aidx, cidx, title = entry
                 text = self._fetch_text(aidx, cidx)
-                doc = Document(
+                pooled.append((Document(
                     page_content=text,
-                    metadata={
-                        "title": title,
-                        "article_idx": aidx,
-                        "chunk_idx": cidx,
-                    },
-                )
-                pooled.append((doc, float(dist)))
+                    metadata={"title": title,
+                              "article_idx": aidx, "chunk_idx": cidx},
+                ), float(dist)))
+            if verbose:
+                print(f"[search] shard {i}/{len(self.indexes)} "
+                      f"searched in {time.time()-ts:,.2f}s", flush=True)
         return pooled
 
 

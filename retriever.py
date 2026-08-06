@@ -190,7 +190,7 @@ class SimpleHybridRetriever:
 
         self.stemmer = Stemmer("english")
 
-    def hybrid_retrieve(self, query, k=5, rrf_k=60, fetch_multiplier=2):
+    def hybrid_retrieve(self, query, k=8, rrf_k=60, fetch_multiplier=2):
         fetch_k = k * fetch_multiplier
         rrf_scores = {}
         doc_map = {}
@@ -234,7 +234,7 @@ class SimpleHybridRetriever:
             for key, score in sorted_keys[:k]
         ]
 
-    def mcqa_hybrid_retrieve(self, question, choices, k=5, k_per_choice=3):
+    def mcqa_hybrid_retrieve(self, question, choices, k=8, k_per_choice=3):
         all_results = {}
         for choice in choices:
             query = f"{question} {choice}"
